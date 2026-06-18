@@ -43,17 +43,27 @@ You score every submission against this 21-FLAG RED-FLAG FRAMEWORK (each flag's 
 
 ${FLAG_FRAMEWORK.map(f => `Flag ${f.n} (weight ${f.weight}): ${f.name}`).join('\n')}
 
-SCORING RULES (the score must feel intuitive to an ordinary investor — a blatant scam should score 80–100, a clean registered fund 0–20):
+SCORING RULES — use the OFFICIAL InvestSafe Pro explainable scoring formula EXACTLY (do not invent your own):
 - For each flag, decide if it is TRIGGERED by the submitted material.
-- If triggered, assign a "severity" from 1–10 (how strongly the evidence in the text supports this flag).
+- If triggered, assign:
+   • "severity" 1–10 (how serious / strongly supported this flag is), AND
+   • an "evidenceTier" describing how strong the proof is:
+        Tier 1 = primary-source / direct documentary proof (e.g. the PPM text itself, a Form D, a FINRA bar record, an audited statement).
+        Tier 2 = strong secondary evidence (e.g. the promoter's own ad / brochure / website language quoted verbatim).
+        Tier 3 = weaker / indirect / circumstantial evidence.
+        Tier 4 = inference or pattern-match only (no concrete proof in the material).
+        GAP = the flag is SUSPECTED but the required evidence is simply MISSING from what was provided (e.g. "no PPM disclosed", "no failed-deal history shown").
+- EVIDENCE-TIER CAP RULE (mandatory):
+   • Tier 1 or Tier 2 evidence → severity may be 1–10 as warranted.
+   • Tier 3 or Tier 4 evidence → severity is CAPPED at 5 maximum.
+   • GAP items → severity = 0 and weightedPoints = 0 (they are listed as "source gaps", they do NOT add to the score).
 - weightedPoints = round( weight * severity / 10 ).
-- Compute riskScore as an INTUITIVE 0–100 danger rating, NOT a simple percentage of all 21 weights. Use this guidance:
-  • If even ONE weight-10 flag fires at high severity (e.g. guaranteed/risk-free returns, FINRA-barred promoter, false FDIC claims, impossible ratios), the score should be at least 70.
-  • Each additional strong flag (severity 7+) should push the score meaningfully higher.
-  • 3+ strong flags together = Critical (85–100).
-  • A formula that works well: riskScore = min(100, round( (highestWeightedPoints * 7) + (sum of all OTHER weightedPoints * 1.4) )). Apply judgment so the final number matches the real danger.
+- riskScore = round( (sum of weightedPoints of ALL triggered flags) / (maximum possible points) * 100 ), where maximum possible points = sum of (weight * 1.0) over every flag actually triggered with a non-GAP tier... NO — use the OFFICIAL denominator: maximum = sum of the FULL WEIGHT of every triggered (non-GAP) flag (i.e. as if each triggered flag were severity 10). So:
+        riskScore = round( totalWeightedPoints / totalTriggeredFullWeight * 100 ).
+   If no non-GAP flags are triggered, riskScore = 0.
 - riskLevel: 0–24 = "Low", 25–49 = "Medium", 50–74 = "High", 75–100 = "Critical".
-- Be fair to legitimate offerings: a well-disclosed, registered, conservatively-marketed investment with no triggered flags should score 0–15 (Low).
+- "keyDrivers": list the flag numbers that each contribute >= 15% of the maximum (i.e. the dominant score drivers). Use plain integers.
+- Be fair to legitimate offerings: a well-disclosed, registered, conservatively-marketed investment with no triggered flags should score 0 (Low).
 
 IMPORTANT ANALYSIS GUIDANCE:
 - Treat extraordinary, "guaranteed", or "risk-free" returns as major flags.
@@ -66,8 +76,14 @@ IMPORTANT ANALYSIS GUIDANCE:
 
 You must respond with ONLY a single valid JSON object (no markdown fences, no commentary) in EXACTLY this shape:
 {
-  "riskScore": <integer 0-100>,
+  "riskScore": <integer 0-100, computed with the official formula above>,
   "riskLevel": "Low" | "Medium" | "High" | "Critical",
+  "scoreBreakdown": {
+    "totalWeightedPoints": <integer, sum of weightedPoints of triggered non-GAP flags>,
+    "maxPossiblePoints": <integer, sum of full weight of triggered non-GAP flags>,
+    "formula": "totalWeightedPoints ÷ maxPossiblePoints × 100",
+    "keyDrivers": [<flag numbers contributing >= 15% of max>]
+  },
   "verdict": "<one-sentence plain-English bottom line a non-expert investor understands>",
   "summary": "<2-4 sentence plain-English explanation of the overall finding>",
   "triggeredFlags": [
@@ -75,9 +91,10 @@ You must respond with ONLY a single valid JSON object (no markdown fences, no co
       "n": <flag number 1-21>,
       "name": "<flag name>",
       "weight": <flag weight>,
-      "severity": <1-10>,
+      "severity": <0-10, 0 only for GAP items>,
+      "evidenceTier": "Tier 1" | "Tier 2" | "Tier 3" | "Tier 4" | "GAP",
       "weightedPoints": <integer>,
-      "evidence": "<short quote or paraphrase from the submitted text that triggers this flag>",
+      "evidence": "<short quote or paraphrase from the submitted text that triggers this flag, OR for GAP: what evidence is missing>",
       "explanation": "<plain-English why this matters to an investor>"
     }
   ],
@@ -160,52 +177,85 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
   return normalizeResult(parsed)
 }
 
-// Defensive normalization so the frontend always gets a consistent shape.
+const VALID_TIERS = ['Tier 1', 'Tier 2', 'Tier 3', 'Tier 4', 'GAP']
+
+function normalizeTier(t: any): string {
+  const s = String(t || '').trim()
+  const found = VALID_TIERS.find((v) => v.toLowerCase() === s.toLowerCase())
+  if (found) return found
+  // tolerate "1", "tier1", "t1", "gap"
+  const m = s.match(/([1-4])/)
+  if (s.toLowerCase().includes('gap')) return 'GAP'
+  if (m) return `Tier ${m[1]}`
+  return 'Tier 2'
+}
+
+// Defensive normalization + AUTHORITATIVE re-computation of the official
+// InvestSafe Pro explainable score (total ÷ max × 100), enforcing the
+// Evidence-Tier cap rule:  Tier 3/4 caps severity at 5;  GAP scores 0.
 function normalizeResult(r: any) {
-  const maxTotal = FLAG_FRAMEWORK.reduce((s, f) => s + f.weight, 0)
   let flags = Array.isArray(r.triggeredFlags) ? r.triggeredFlags : []
   flags = flags
     .filter((f: any) => f && typeof f.n !== 'undefined')
     .map((f: any) => {
       const def = FLAG_FRAMEWORK.find((d) => d.n === Number(f.n))
       const weight = def ? def.weight : Number(f.weight) || 5
-      const severity = clamp(Number(f.severity) || 5, 1, 10)
-      const weightedPoints =
-        typeof f.weightedPoints === 'number'
-          ? Math.round(f.weightedPoints)
-          : Math.round((weight * severity) / 10)
+      const tier = normalizeTier(f.evidenceTier)
+      let severity = clamp(Math.round(Number(f.severity)) || 0, 0, 10)
+
+      // Evidence-Tier cap rule
+      if (tier === 'GAP') {
+        severity = 0
+      } else if (tier === 'Tier 3' || tier === 'Tier 4') {
+        severity = Math.min(severity, 5)
+        if (severity < 1) severity = 1
+      } else {
+        if (severity < 1) severity = 1
+      }
+
+      const weightedPoints = tier === 'GAP' ? 0 : Math.round((weight * severity) / 10)
       return {
         n: Number(f.n),
         name: def ? def.name : String(f.name || 'Flag'),
         weight,
         severity,
+        evidenceTier: tier,
         weightedPoints,
         evidence: String(f.evidence || ''),
         explanation: String(f.explanation || ''),
       }
     })
 
-  let riskScore = Number(r.riskScore)
-  if (!Number.isFinite(riskScore)) {
-    // Intuitive fallback: heavily weight the single strongest flag, add the rest.
-    const pts = flags.map((f: any) => f.weightedPoints).sort((a: number, b: number) => b - a)
-    const top = pts[0] || 0
-    const rest = pts.slice(1).reduce((s: number, p: number) => s + p, 0)
-    riskScore = Math.round(top * 7 + rest * 1.4)
-  }
-  riskScore = clamp(Math.round(riskScore), 0, 100)
+  // Official formula: total ÷ max × 100, where max = full weight of every
+  // triggered NON-GAP flag (i.e. as if each were severity 10).
+  const scored = flags.filter((f: any) => f.evidenceTier !== 'GAP')
+  const totalWeightedPoints = scored.reduce((s: number, f: any) => s + f.weightedPoints, 0)
+  const maxPossiblePoints = scored.reduce((s: number, f: any) => s + f.weight, 0)
+  const riskScore = maxPossiblePoints > 0 ? clamp(Math.round((totalWeightedPoints / maxPossiblePoints) * 100), 0, 100) : 0
 
-  let riskLevel = String(r.riskLevel || '')
-  if (!['Low', 'Medium', 'High', 'Critical'].includes(riskLevel)) {
-    riskLevel = riskScore >= 75 ? 'Critical' : riskScore >= 50 ? 'High' : riskScore >= 25 ? 'Medium' : 'Low'
-  }
+  // Key drivers: flags contributing >= 15% of the maximum.
+  const keyDrivers = scored
+    .filter((f: any) => maxPossiblePoints > 0 && f.weightedPoints / maxPossiblePoints >= 0.15)
+    .map((f: any) => f.n)
+
+  const riskLevel = riskScore >= 75 ? 'Critical' : riskScore >= 50 ? 'High' : riskScore >= 25 ? 'Medium' : 'Low'
 
   return {
     riskScore,
     riskLevel,
+    scoreBreakdown: {
+      totalWeightedPoints,
+      maxPossiblePoints,
+      formula: 'totalWeightedPoints ÷ maxPossiblePoints × 100',
+      keyDrivers,
+    },
     verdict: String(r.verdict || ''),
     summary: String(r.summary || ''),
-    triggeredFlags: flags.sort((a: any, b: any) => b.weightedPoints - a.weightedPoints),
+    // Show GAP items last; otherwise highest weighted points first.
+    triggeredFlags: flags.sort((a: any, b: any) => {
+      if ((a.evidenceTier === 'GAP') !== (b.evidenceTier === 'GAP')) return a.evidenceTier === 'GAP' ? 1 : -1
+      return b.weightedPoints - a.weightedPoints
+    }),
     extractedClaims: Array.isArray(r.extractedClaims) ? r.extractedClaims : [],
     contradictions: Array.isArray(r.contradictions) ? r.contradictions : [],
     verifyNext: Array.isArray(r.verifyNext) ? r.verifyNext : [],
@@ -215,7 +265,6 @@ function normalizeResult(r: any) {
         'This is an educational due-diligence aid, not legal or financial advice. Always verify with primary sources and consult a licensed professional.'
     ),
     analyzedAt: new Date().toISOString(),
-    maxTotal,
   }
 }
 

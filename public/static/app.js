@@ -163,21 +163,43 @@
 
   /* ── render result ── */
   const levelColor = { Low: 'var(--green)', Medium: 'var(--gold)', High: '#f57823', Critical: 'var(--red)' };
+  const tierClass = (t) => t === 'GAP' ? 'tier-gap' : 'tier-' + (String(t).match(/\d/) || ['2'])[0];
   let lastResult = null;
   function renderResult(r) {
     lastResult = r;
     const c = levelColor[r.riskLevel] || 'var(--blue)';
     const flagsHtml = (r.triggeredFlags || []).length
-      ? r.triggeredFlags.map((f) => `
-        <div class="flag-row" style="border-left-color:${c}">
+      ? r.triggeredFlags.map((f) => {
+        const isGap = f.evidenceTier === 'GAP';
+        return `
+        <div class="flag-row ${isGap ? 'is-gap' : ''}" style="border-left-color:${isGap ? 'var(--muted-2)' : c}">
           <div class="fr-top">
             <span class="fr-name">#${f.n} · ${esc(f.name)}</span>
-            <span class="fr-sev">Severity ${f.severity}/10</span>
+            <span class="fr-tier ${tierClass(f.evidenceTier)}">${esc(f.evidenceTier)}</span>
+            <span class="fr-sev">${isGap ? '0 pts' : 'Sev ' + f.severity + ' · ' + f.weightedPoints + ' pts'}</span>
           </div>
-          ${f.evidence ? `<div class="fr-ev">“${esc(f.evidence)}”</div>` : ''}
+          ${f.evidence ? `<div class="fr-ev">${isGap ? '<i class="fas fa-circle-question"></i> Missing: ' : '“'}${esc(f.evidence)}${isGap ? '' : '”'}</div>` : ''}
           <div class="fr-ex">${esc(f.explanation)}</div>
-        </div>`).join('')
+        </div>`;
+      }).join('')
       : `<div class="no-flags"><i class="fas fa-circle-check"></i> No major fraud red flags were detected in this material. Still verify independently before investing.</div>`;
+
+    // Explainable score breakdown table
+    const sb = r.scoreBreakdown || {};
+    const scoredFlags = (r.triggeredFlags || []).filter((f) => f.evidenceTier !== 'GAP');
+    const breakdownHtml = scoredFlags.length ? `
+      <table class="score-table">
+        <thead><tr><th>#</th><th>Flag</th><th>Wt</th><th>Sev</th><th>Tier</th><th>Pts</th></tr></thead>
+        <tbody>
+          ${scoredFlags.map((f) => `<tr${(sb.keyDrivers || []).includes(f.n) ? ' class="driver"' : ''}>
+            <td>${f.n}</td><td>${esc(f.name)}</td><td>${f.weight}</td><td>${f.severity}</td>
+            <td><span class="fr-tier ${tierClass(f.evidenceTier)}">${esc(f.evidenceTier)}</span></td><td><b>${f.weightedPoints}</b></td></tr>`).join('')}
+        </tbody>
+        <tfoot><tr><td colspan="5">Total weighted points ÷ max possible × 100</td>
+          <td><b>${sb.totalWeightedPoints ?? 0}/${sb.maxPossiblePoints ?? 0}</b></td></tr></tfoot>
+      </table>
+      <div class="score-calc">${sb.totalWeightedPoints ?? 0} ÷ ${sb.maxPossiblePoints ?? 0} × 100 = <b>${r.riskScore}/100</b>
+        ${(sb.keyDrivers || []).length ? ` · Key drivers: ${sb.keyDrivers.map((n) => '#' + n).join(', ')}` : ''}</div>` : '';
 
     const claimsHtml = (r.extractedClaims || []).map((x) => `
       <div class="kv-row">
@@ -216,6 +238,8 @@
         ${flagsHtml}
       </div>
 
+      ${breakdownHtml ? `<details class="res-section breakdown-details"><summary><i class="fas fa-calculator" style="color:var(--teal)"></i> How this score was calculated</summary>${breakdownHtml}</details>` : ''}
+
       ${claimsHtml ? `<div class="res-section"><h4><i class="fas fa-comment-dollar" style="color:var(--gold)"></i> Claims to verify</h4>${claimsHtml}</div>` : ''}
       ${contraHtml ? `<div class="res-section"><h4><i class="fas fa-not-equal" style="color:var(--red)"></i> Possible contradictions</h4>${contraHtml}</div>` : ''}
       ${verifyHtml ? `<div class="res-section"><h4><i class="fas fa-list-check" style="color:var(--teal)"></i> What to do next</h4>${verifyHtml}</div>` : ''}
@@ -250,12 +274,18 @@
   }
 
   function reportText(r) {
+    const sb = r.scoreBreakdown || {};
     let t = `INVESTSAFE PRO — FRAUD RISK REPORT\n`;
     t += `Generated: ${new Date(r.analyzedAt || Date.now()).toLocaleString()}\n`;
     t += `\nRISK SCORE: ${r.riskScore}/100 (${r.riskLevel})\n`;
+    t += `SCORE BASIS: ${sb.totalWeightedPoints ?? 0} ÷ ${sb.maxPossiblePoints ?? 0} × 100\n`;
     t += `VERDICT: ${r.verdict}\n\n${r.summary}\n`;
     t += `\nRED FLAGS FOUND (${(r.triggeredFlags || []).length}):\n`;
-    (r.triggeredFlags || []).forEach((f) => { t += `  • #${f.n} ${f.name} (severity ${f.severity}/10)\n    ${f.explanation}\n`; });
+    (r.triggeredFlags || []).forEach((f) => {
+      t += f.evidenceTier === 'GAP'
+        ? `  • #${f.n} ${f.name} [SOURCE GAP — 0 pts]\n    ${f.explanation}\n`
+        : `  • #${f.n} ${f.name} (sev ${f.severity}/10, ${f.evidenceTier}, ${f.weightedPoints} pts)\n    ${f.explanation}\n`;
+    });
     if ((r.contradictions || []).length) { t += `\nPOSSIBLE CONTRADICTIONS:\n`; r.contradictions.forEach((x) => t += `  • ${x.claim} → ${x.reality}\n`); }
     if ((r.verifyNext || []).length) { t += `\nWHAT TO DO NEXT:\n`; r.verifyNext.forEach((x) => t += `  • ${x.action}${x.where ? ' (' + x.where + ')' : ''}\n`); }
     t += `\nADVICE:\n${r.investorAdvice}\n\n${r.disclaimer}`;
@@ -268,7 +298,10 @@
   function printReport(r) {
     const w = window.open('', '_blank');
     if (!w) { toast('Allow pop-ups to print.', 'err'); return; }
-    const flags = (r.triggeredFlags || []).map((f) => `<li><b>#${f.n} ${esc(f.name)}</b> — severity ${f.severity}/10. ${esc(f.explanation)}</li>`).join('');
+    const sb = r.scoreBreakdown || {};
+    const flags = (r.triggeredFlags || []).map((f) => f.evidenceTier === 'GAP'
+      ? `<li><b>#${f.n} ${esc(f.name)}</b> — <i>source gap (0 pts)</i>. ${esc(f.explanation)}</li>`
+      : `<li><b>#${f.n} ${esc(f.name)}</b> — severity ${f.severity}/10, ${esc(f.evidenceTier)}, ${f.weightedPoints} pts. ${esc(f.explanation)}</li>`).join('');
     w.document.write(`<html><head><title>InvestSafe Pro Report</title><style>
       body{font-family:Inter,Arial,sans-serif;max-width:760px;margin:30px auto;padding:0 24px;color:#1a2035;line-height:1.6}
       h1{font-size:22px}.score{font-size:40px;font-weight:900}.lvl{font-weight:800}
@@ -276,7 +309,9 @@
       li{margin-bottom:8px}.muted{color:#777;font-size:12px}</style></head><body>
       <h1>🛡️ InvestSafe Pro™ — Fraud Risk Report</h1>
       <p class="muted">Generated ${new Date(r.analyzedAt || Date.now()).toLocaleString()}</p>
-      <div class="box"><div class="score">${r.riskScore}/100</div><div class="lvl">${esc(r.riskLevel)} risk</div><p>${esc(r.verdict)}</p><p>${esc(r.summary)}</p></div>
+      <div class="box"><div class="score">${r.riskScore}/100</div><div class="lvl">${esc(r.riskLevel)} risk</div>
+        <p class="muted">Score: ${sb.totalWeightedPoints ?? 0} ÷ ${sb.maxPossiblePoints ?? 0} × 100</p>
+        <p>${esc(r.verdict)}</p><p>${esc(r.summary)}</p></div>
       <h3>Red flags found (${(r.triggeredFlags || []).length})</h3><ul>${flags || '<li>None detected.</li>'}</ul>
       <h3>Advice</h3><p>${esc(r.investorAdvice)}</p>
       <p class="muted">${esc(r.disclaimer)}</p></body></html>`);

@@ -23,7 +23,24 @@ managed API key, so users never have to bring their own.
   optional, all improve accuracy.
 - **Server-side AI analysis (NO BYOK)** — uses a managed OpenAI-compatible key on the backend.
   Users never see or enter an API key.
-- **21-flag forensic framework** — every submission is scored against 21 weighted fraud patterns.
+- **21-flag forensic framework** — every submission is scored against 21 weighted fraud patterns
+  using the **official InvestSafe Pro explainable scoring formula** (see below).
+- **Explainable score breakdown** — an expandable table showing Flag # | Name | Weight | Severity |
+  Evidence Tier | Weighted Points, the exact calculation, and the key score drivers.
+
+### Official Scoring Methodology (matches the original IIE engine)
+- Each triggered flag gets a **severity (1–10)** and an **Evidence Tier**:
+  - **Tier 1** – primary-source proof · **Tier 2** – the promoter's own quoted language ·
+    **Tier 3 / Tier 4** – weaker / inferred evidence · **GAP** – the flag is suspected but the
+    required evidence is *missing* from what was provided.
+- **Evidence-Tier cap rule**: Tier 3/4 caps severity at 5; **GAP items score 0 points** (they are
+  listed as "source gaps" but never inflate the score).
+- **weightedPoints = round(weight × severity ÷ 10)**.
+- **riskScore = totalWeightedPoints ÷ maxPossiblePoints × 100**, where `maxPossiblePoints` is the
+  full weight of every triggered non-GAP flag (i.e. as if each were severity 10).
+- **riskLevel**: 0–24 Low · 25–49 Medium · 50–74 High · 75–100 Critical.
+- The score is **re-computed authoritatively on the server**, so the displayed number always
+  exactly matches the formula regardless of model output.
 - **Plain-English report** with:
   - Animated 0–100 **risk score** + Low / Medium / High / **Critical** level
   - One-sentence **verdict** + short summary
