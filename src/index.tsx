@@ -17,9 +17,13 @@ app.post('/api/analyze', async (c) => {
   }
 
   const material = (body?.material || '').toString().trim()
-  if (material.length < 30) {
+  const images: string[] = Array.isArray(body?.images)
+    ? body.images.filter((s: any) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 4)
+    : []
+
+  if (material.length < 30 && images.length === 0) {
     return c.json(
-      { error: 'Please paste at least a few sentences of the investment pitch, ad, or document so we can analyze it.' },
+      { error: 'Please paste at least a few sentences — or attach a document or image of the investment pitch — so we can analyze it.' },
       400
     )
   }
@@ -27,6 +31,7 @@ app.post('/api/analyze', async (c) => {
   try {
     const result = await analyzeSubmission(c.env, {
       material,
+      images,
       sponsorName: body?.sponsorName,
       assetType: body?.assetType,
       claimedReturn: body?.claimedReturn,

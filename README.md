@@ -18,7 +18,12 @@ managed API key, so users never have to bring their own.
   conic-gradient risk rings, smooth reveal-on-scroll animations.
 
 ## Key Features (completed)
-- **One-box fraud check** — paste pitch text or drag-and-drop a `.txt/.md/.csv` file.
+- **One-box fraud check** — paste pitch text, **attach files**, or **take a photo**.
+- **Attach almost anything** — drag-and-drop or pick: **PDF** (text auto-extracted in-browser via
+  PDF.js), **images / screenshots** (JPG, PNG, WEBP, GIF, BMP, HEIC — analyzed by a vision model),
+  **Word** `.docx` (extracted via Mammoth.js), and text files (`.txt/.md/.csv/.json/.rtf/.html`).
+  You can also **paste a screenshot** straight into the box, or use **Take photo** on mobile.
+  Up to 4 images per submission; up to 12 MB per file.
 - **Optional detail fields** — promoter name, asset type, promised return, minimum, source — all
   optional, all improve accuracy.
 - **Server-side AI analysis (NO BYOK)** — uses a managed OpenAI-compatible key on the backend.
@@ -81,6 +86,15 @@ managed API key, so users never have to bring their own.
 5. Read your report — risk score, red flags, what to verify, and clear advice. Use **Copy** or
    **Print / Save PDF** to keep it.
 
+### Attaching documents & images
+- Click **Attach file** (or drag a file onto the box) — PDFs and Word docs are read and their text
+  is added to the box automatically; images are attached as thumbnails.
+- Click **Take photo** (mobile) to snap a pitch / ad and have it analyzed directly.
+- **Paste** a screenshot from your clipboard into the box — it attaches as an image.
+- An image-only submission is fine — you don't have to type anything if you've attached a picture.
+- *Note:* scanned PDFs with no selectable text won't extract — attach a screenshot of the page
+  instead so the vision model can read it.
+
 ## Tech Stack
 - **Hono** (edge web framework) on **Cloudflare Pages / Workers**
 - **Vite** + `@hono/vite-build` for the build
@@ -115,12 +129,13 @@ npm run deploy
 - **Platform**: Cloudflare Pages
 - **Status**: ✅ Running locally in sandbox (PM2) · ⏳ Not yet deployed to production
 - **Project name**: `investsafe-pro`
-- **Last Updated**: 2026-06-18
+- **Last Updated**: 2026-06-18 — added PDF / image / Word / text attachment support (incl. vision-model image analysis)
 
 ## Not Yet Implemented / Next Steps
 - Live SEC EDGAR / FINRA BrokerCheck lookups (currently the report tells users *where* to verify).
-- PDF text extraction in-browser (today users paste text or upload `.txt`; PDF upload would need a
-  client-side PDF.js step).
+- OCR for scanned/image-only PDFs (currently selectable-text PDFs extract; scanned pages should be
+  attached as images so the vision model reads them).
+- Legacy `.doc` (old Word binary) support — users are asked to save as `.docx` or PDF.
 - Saved history / shareable report links (would require storage; intentionally omitted for privacy).
 - Multi-language support.
 

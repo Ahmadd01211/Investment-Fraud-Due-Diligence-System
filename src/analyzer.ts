@@ -118,6 +118,8 @@ export interface AnalyzeInput {
   claimedReturn?: string
   amountAsked?: string
   sourceType?: string
+  /** Optional images (data URLs) — e.g. screenshots of an ad / pitch deck pages. */
+  images?: string[]
 }
 
 export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
@@ -135,10 +137,23 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
   if (input.amountAsked) ctx.push(`Minimum investment / amount asked: ${input.amountAsked}`)
   if (input.sourceType) ctx.push(`Where this came from: ${input.sourceType}`)
 
-  const userContent =
+  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 4)
+  const hasImages = images.length > 0
+
+  const textPart =
     (ctx.length ? `INVESTOR-PROVIDED CONTEXT:\n${ctx.join('\n')}\n\n` : '') +
-    `SUBMITTED MATERIAL TO ANALYZE:\n"""\n${input.material.slice(0, 24000)}\n"""\n\n` +
-    `Analyze the submitted material using the 21-flag framework and return the JSON object only.`
+    (input.material && input.material.trim().length
+      ? `SUBMITTED MATERIAL (text) TO ANALYZE:\n"""\n${input.material.slice(0, 24000)}\n"""\n\n`
+      : '') +
+    (hasImages
+      ? `The investor also attached ${images.length} image(s) (e.g. a screenshot of an ad, email, or pitch-deck page). Read ALL text and visual claims in the image(s) and treat them as submitted material.\n\n`
+      : '') +
+    `Analyze everything provided using the 21-flag framework and return the JSON object only.`
+
+  // Build the user message. Vision requires the array content format.
+  const userContent: any = hasImages
+    ? [{ type: 'text', text: textPart }, ...images.map((url) => ({ type: 'image_url', image_url: { url } }))]
+    : textPart
 
   const resp = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
@@ -147,6 +162,7 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
+      // gpt-5-mini supports vision; use it for both text and image inputs.
       model: 'gpt-5-mini',
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },

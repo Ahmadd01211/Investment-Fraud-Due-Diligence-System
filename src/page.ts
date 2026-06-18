@@ -12,6 +12,10 @@ export function HomePage(): string {
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.1/css/all.min.css" />
 <link rel="stylesheet" href="/static/style.css" />
+<!-- client-side document extractors (run in the browser; Workers can't parse files) -->
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script>if(window.pdfjsLib){window.pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';}</script>
+<script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
 </head>
 <body>
 
@@ -137,16 +141,23 @@ export function HomePage(): string {
           <textarea id="material" placeholder="Paste the investment pitch, advertisement, email, or document text here…
 
 Example: 'Earn a GUARANTEED 22% annual return with our real-estate fund. Featured on Facebook & local radio. Limited spots — wire by Friday to lock in your bonus!'"></textarea>
-          <div class="dz-overlay" id="dzOverlay"><i class="fas fa-file-arrow-up"></i><span>Drop a .txt / .md / .csv file to analyze</span></div>
+          <div class="dz-overlay" id="dzOverlay"><i class="fas fa-file-arrow-up"></i><span>Drop your file here — PDF, image, Word, or text</span></div>
         </div>
 
+        <!-- attachment chips -->
+        <div class="attach-list" id="attachList"></div>
+
         <div class="dz-actions">
-          <label class="mini-btn" for="fileInput"><i class="fas fa-paperclip"></i> Attach a text file</label>
-          <input type="file" id="fileInput" accept=".txt,.md,.csv,.json,text/plain" hidden />
-          <button class="mini-btn" id="sampleBtn" type="button"><i class="fas fa-flask"></i> Load sample pitch</button>
+          <label class="mini-btn" for="fileInput"><i class="fas fa-paperclip"></i> Attach file</label>
+          <input type="file" id="fileInput" multiple hidden
+            accept=".pdf,.png,.jpg,.jpeg,.webp,.gif,.bmp,.heic,.doc,.docx,.txt,.md,.csv,.json,.rtf,.html,.htm,application/pdf,image/*,text/plain" />
+          <label class="mini-btn" for="cameraInput"><i class="fas fa-camera"></i> Take photo</label>
+          <input type="file" id="cameraInput" accept="image/*" capture="environment" hidden />
+          <button class="mini-btn" id="sampleBtn" type="button"><i class="fas fa-flask"></i> Sample</button>
           <button class="mini-btn danger" id="clearBtn" type="button"><i class="fas fa-eraser"></i> Clear</button>
           <span class="char-count" id="charCount">0 characters</span>
         </div>
+        <div class="accept-note"><i class="fas fa-circle-check"></i> Accepts <strong>PDF</strong>, <strong>images / screenshots</strong> (JPG, PNG, etc.), <strong>Word</strong> (.docx), and text files — or just paste above.</div>
 
         <details class="more-details">
           <summary><i class="fas fa-sliders"></i> Add optional details (improves accuracy)</summary>

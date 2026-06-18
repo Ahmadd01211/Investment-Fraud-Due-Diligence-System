@@ -58,21 +58,148 @@
   /* ── file upload + drag/drop ── */
   const dropzone = $('#dropzone');
   const fileInput = $('#fileInput');
-  function readFile(file) {
-    if (!file) return;
-    if (file.size > 2 * 1024 * 1024) { toast('File is too large (max 2 MB of text).', 'err'); return; }
-    const reader = new FileReader();
-    reader.onload = () => { material.value = String(reader.result || '').slice(0, 40000); updateCount(); toast(`Loaded "${file.name}"`, 'ok'); };
-    reader.onerror = () => toast('Could not read that file.', 'err');
-    reader.readAsText(file);
+  const cameraInput = $('#cameraInput');
+  const attachList = $('#attachList');
+
+  /* attached images go to the vision backend; max 4 */
+  const attachedImages = []; // { name, dataUrl }
+  const MAX_IMAGES = 4;
+  const MAX_FILE = 12 * 1024 * 1024; // 12 MB per file
+
+  function fileKind(file) {
+    const n = (file.name || '').toLowerCase();
+    const t = (file.type || '').toLowerCase();
+    if (t.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp|heic|heif)$/.test(n)) return 'image';
+    if (t === 'application/pdf' || n.endsWith('.pdf')) return 'pdf';
+    if (n.endsWith('.docx') || t.indexOf('officedocument.wordprocessing') !== -1) return 'docx';
+    if (n.endsWith('.doc')) return 'doc';
+    if (/\.(txt|md|csv|json|rtf|html?|log|tsv)$/.test(n) || t.startsWith('text/')) return 'text';
+    return 'text'; // attempt text fallback
   }
-  fileInput.addEventListener('change', (e) => readFile(e.target.files[0]));
+
+  function readAsText(file) {
+    return new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(String(r.result || ''));
+      r.onerror = () => rej(new Error('read error'));
+      r.readAsText(file);
+    });
+  }
+  function readAsDataURL(file) {
+    return new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(String(r.result || ''));
+      r.onerror = () => rej(new Error('read error'));
+      r.readAsDataURL(file);
+    });
+  }
+  function readAsArrayBuffer(file) {
+    return new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(r.result);
+      r.onerror = () => rej(new Error('read error'));
+      r.readAsArrayBuffer(file);
+    });
+  }
+
+  async function extractPdf(file) {
+    if (!window.pdfjsLib) throw new Error('PDF reader still loading — try again in a moment.');
+    const buf = await readAsArrayBuffer(file);
+    const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
+    let out = '';
+    const pages = Math.min(pdf.numPages, 40);
+    for (let i = 1; i <= pages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      out += content.items.map((it) => it.str).join(' ') + '\n\n';
+      if (out.length > 40000) break;
+    }
+    return out.trim();
+  }
+  async function extractDocx(file) {
+    if (!window.mammoth) throw new Error('Word reader still loading — try again in a moment.');
+    const buf = await readAsArrayBuffer(file);
+    const res = await window.mammoth.extractRawText({ arrayBuffer: buf });
+    return String(res.value || '').trim();
+  }
+
+  function appendToMaterial(text, label) {
+    const t = String(text || '').trim();
+    if (!t) return false;
+    const prefix = material.value.trim() ? material.value.trimEnd() + '\n\n' : '';
+    material.value = (prefix + (label ? `--- ${label} ---\n` : '') + t).slice(0, 60000);
+    updateCount();
+    return true;
+  }
+
+  function renderAttachList() {
+    attachList.innerHTML = attachedImages.map((a, i) => `
+      <div class="attach-chip" title="${esc(a.name)}">
+        <img src="${a.dataUrl}" alt="" />
+        <span>${esc(a.name.length > 22 ? a.name.slice(0, 20) + '…' : a.name)}</span>
+        <button type="button" data-i="${i}" aria-label="Remove"><i class="fas fa-times"></i></button>
+      </div>`).join('');
+    attachList.classList.toggle('has', attachedImages.length > 0);
+    $$('.attach-chip button', attachList).forEach((b) =>
+      b.addEventListener('click', () => { attachedImages.splice(+b.dataset.i, 1); renderAttachList(); }));
+  }
+
+  async function handleFiles(fileList) {
+    const files = [...fileList].filter(Boolean);
+    if (!files.length) return;
+    for (const file of files) {
+      if (file.size > MAX_FILE) { toast(`"${file.name}" is too large (max 12 MB).`, 'err'); continue; }
+      const kind = fileKind(file);
+      try {
+        if (kind === 'image') {
+          if (attachedImages.length >= MAX_IMAGES) { toast(`You can attach up to ${MAX_IMAGES} images.`, 'err'); continue; }
+          const dataUrl = await readAsDataURL(file);
+          attachedImages.push({ name: file.name || 'image', dataUrl });
+          renderAttachList();
+          toast(`Attached image "${file.name}"`, 'ok');
+        } else if (kind === 'pdf') {
+          toast(`Reading PDF "${file.name}"…`, 'ok');
+          const text = await extractPdf(file);
+          if (text.length < 10) {
+            // Likely a scanned/image PDF — offer to attach pages as image? Inform user.
+            toast(`"${file.name}" has little selectable text — if it's a scanned PDF, attach a screenshot instead.`, 'err');
+          } else {
+            appendToMaterial(text, file.name);
+            toast(`Loaded text from "${file.name}"`, 'ok');
+          }
+        } else if (kind === 'docx') {
+          toast(`Reading Word doc "${file.name}"…`, 'ok');
+          appendToMaterial(await extractDocx(file), file.name);
+          toast(`Loaded "${file.name}"`, 'ok');
+        } else if (kind === 'doc') {
+          toast('.doc (old Word) isn\'t supported — please save as .docx or PDF, or paste the text.', 'err');
+        } else {
+          const text = await readAsText(file);
+          appendToMaterial(text, file.name);
+          toast(`Loaded "${file.name}"`, 'ok');
+        }
+      } catch (err) {
+        toast(`Could not read "${file.name}". ${err.message || ''}`, 'err');
+      }
+    }
+  }
+
+  fileInput.addEventListener('change', (e) => { handleFiles(e.target.files); e.target.value = ''; });
+  cameraInput.addEventListener('change', (e) => { handleFiles(e.target.files); e.target.value = ''; });
   ['dragenter', 'dragover'].forEach((ev) => dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.add('drag'); }));
-  ['dragleave', 'drop'].forEach((ev) => dropzone.addEventListener(ev, (e) => { e.preventDefault(); if (ev === 'drop') readFile(e.dataTransfer.files[0]); dropzone.classList.remove('drag'); }));
+  ['dragleave', 'drop'].forEach((ev) => dropzone.addEventListener(ev, (e) => { e.preventDefault(); if (ev === 'drop') handleFiles(e.dataTransfer.files); dropzone.classList.remove('drag'); }));
+
+  // paste an image directly into the textarea (e.g. screenshot from clipboard)
+  material.addEventListener('paste', (e) => {
+    const items = (e.clipboardData || {}).items || [];
+    const imgs = [...items].filter((it) => it.kind === 'file' && it.type.startsWith('image/'));
+    if (imgs.length) { e.preventDefault(); handleFiles(imgs.map((it) => it.getAsFile())); }
+  });
 
   /* ── clear ── */
   $('#clearBtn').addEventListener('click', () => {
     material.value = ''; updateCount();
+    attachedImages.length = 0; renderAttachList();
     ['sponsorName', 'assetType', 'claimedReturn', 'amountAsked'].forEach((id) => { $('#' + id).value = ''; });
     $('#sourceType').value = '';
     showState('empty'); material.focus();
@@ -129,7 +256,11 @@
 
   async function analyze() {
     const text = material.value.trim();
-    if (text.length < 30) { toast('Please paste at least a few sentences to analyze.', 'err'); material.focus(); return; }
+    if (text.length < 30 && attachedImages.length === 0) {
+      toast('Please paste at least a few sentences — or attach a document or image — to analyze.', 'err');
+      material.focus();
+      return;
+    }
     analyzeBtn.disabled = true;
     analyzeBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Analyzing…';
     showState('loading'); cycleMsgs();
@@ -142,6 +273,7 @@
       claimedReturn: $('#claimedReturn').value.trim(),
       amountAsked: $('#amountAsked').value.trim(),
       sourceType: $('#sourceType').value.trim(),
+      images: attachedImages.map((a) => a.dataUrl),
     };
     try {
       const res = await fetch('/api/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
