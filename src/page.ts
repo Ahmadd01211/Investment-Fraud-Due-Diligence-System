@@ -248,11 +248,6 @@ Example: 'Earn a GUARANTEED 22% annual return with our real-estate fund. Feature
   </div>
 </footer>
 
-<!-- modal for full flag detail -->
-<div class="modal-backdrop" id="modal" hidden>
-  <div class="modal glass" id="modalBox"></div>
-</div>
-
 <script src="/static/app.js"></script>
 </body>
 </html>`
