@@ -153,7 +153,7 @@ npm run deploy
 - **Platform**: Cloudflare Pages
 - **Status**: ✅ Running locally in sandbox (PM2) · ⏳ Not yet deployed to production
 - **Project name**: `investsafe-pro`
-- **Last Updated**: 2026-06-30 — wired to OpenAI GPT-5.4 (vision) / GPT-5.4-mini (text) with smart routing; fixed GPT-5 `max_completion_tokens` requirement; verified live on real PPM (707 Franklin → 36/Medium)
+- **Last Updated**: 2026-06-30 — deterministic scoring (temperature 0 + seed; severity fixed by evidence tier; consistency rules) so the same submission scores the same every time; rejects non-investment submissions; GPT-5.4 vision / GPT-5.4-mini text
 
 ## Not Yet Implemented / Next Steps
 - Live SEC EDGAR / FINRA BrokerCheck lookups (currently the report tells users *where* to verify).

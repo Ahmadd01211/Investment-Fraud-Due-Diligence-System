@@ -49,20 +49,22 @@ You score every submission against this 21-FLAG RED-FLAG FRAMEWORK (each flag's 
 
 ${FLAG_FRAMEWORK.map(f => `Flag ${f.n} (weight ${f.weight}): ${f.name}`).join('\n')}
 
-SCORING RULES — use the OFFICIAL InvestSafe Pro explainable scoring formula EXACTLY (do not invent your own):
+SCORING RULES — use the OFFICIAL InvestSafe Pro explainable scoring formula EXACTLY (do not invent your own). To keep results CONSISTENT and REPEATABLE, severity is DETERMINED BY the evidence tier — you do NOT freely pick it:
 - For each flag, decide if it is TRIGGERED by the submitted material.
-- If triggered, assign:
-   • "severity" 1–10 (how serious / strongly supported this flag is), AND
-   • an "evidenceTier" describing how strong the proof is:
-        Tier 1 = primary-source / direct documentary proof (e.g. the PPM text itself, a Form D, a FINRA bar record, an audited statement).
-        Tier 2 = strong secondary evidence (e.g. the promoter's own ad / brochure / website language quoted verbatim).
-        Tier 3 = weaker / indirect / circumstantial evidence.
-        Tier 4 = inference or pattern-match only (no concrete proof in the material).
-        GAP = the flag is SUSPECTED but the required evidence is simply MISSING from what was provided (e.g. "no PPM disclosed", "no failed-deal history shown").
-- EVIDENCE-TIER CAP RULE (mandatory):
-   • Tier 1 or Tier 2 evidence → severity may be 1–10 as warranted.
-   • Tier 3 or Tier 4 evidence → severity is CAPPED at 5 maximum.
-   • GAP items → severity = 0 and weightedPoints = 0 (they are listed as "source gaps", they do NOT add to the score).
+- If triggered, assign an "evidenceTier" describing how strong the proof is, then the severity is FIXED by the tier:
+        Tier 1 = primary-source / direct documentary proof (e.g. the PPM text itself, a Form D, a FINRA bar record, an audited statement).  → severity = 10
+        Tier 2 = strong secondary evidence (e.g. the promoter's own ad / brochure / website language quoted verbatim).                     → severity = 8
+        Tier 3 = weaker / indirect / circumstantial evidence.                                                                              → severity = 5
+        Tier 4 = inference or pattern-match only (no concrete proof in the material).                                                       → severity = 3
+        GAP = the flag is SUSPECTED but the required evidence is simply MISSING from what was provided (e.g. "no PPM disclosed").           → severity = 0
+- MANDATORY: set "severity" to EXACTLY the fixed number above for the chosen tier. Do NOT use any other value. This makes scoring deterministic.
+- GAP items → severity = 0 and weightedPoints = 0 (they are listed as "source gaps", they do NOT add to the score).
+- Choose the tier by the strength of EVIDENCE actually present, not by how bad the flag feels. Be consistent: the same evidence must always get the same tier.
+- CONSISTENCY RULES (critical — follow exactly so the same document always scores the same):
+   • Only TRIGGER a flag when there is concrete support in the material. Do NOT trigger a flag on a hunch; if you are unsure whether a flag applies, do NOT include it.
+   • Use the HIGHEST tier the evidence clearly supports — pick the single best-fitting tier; do not hedge between two tiers.
+   • If a required disclosure is simply absent (not affirmatively wrong), classify it as GAP (severity 0), NOT as a triggered Tier 3/4 flag.
+   • Apply the same standard to every submission; identical wording must produce the identical set of flags and tiers.
 - weightedPoints = round( weight * severity / 10 ).
 - riskScore = round( (sum of weightedPoints of ALL triggered flags) / (maximum possible points) * 100 ), where maximum possible points = sum of (weight * 1.0) over every flag actually triggered with a non-GAP tier... NO — use the OFFICIAL denominator: maximum = sum of the FULL WEIGHT of every triggered (non-GAP) flag (i.e. as if each triggered flag were severity 10). So:
         riskScore = round( totalWeightedPoints / totalTriggeredFullWeight * 100 ).
@@ -185,18 +187,34 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
       { role: 'user', content: userContent },
     ],
     response_format: { type: 'json_object' },
+    // Determinism: temperature 0 + fixed seed makes the same submission yield
+    // the same score on repeat runs (as much as the API allows).
+    temperature: 0,
+    seed: 42,
   }
   if (usesCompletionTokens) reqBody.max_completion_tokens = 6000
   else reqBody.max_tokens = 4000
 
-  const resp = await fetch(`${baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(reqBody),
-  })
+  const callApi = (b: any) =>
+    fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify(b),
+    })
+
+  let resp = await callApi(reqBody)
+
+  // Some models reject custom temperature/seed — retry once without them.
+  if (!resp.ok) {
+    const peek = await resp.clone().text().catch(() => '')
+    const pl = peek.toLowerCase()
+    if (resp.status === 400 && (pl.includes('temperature') || pl.includes('seed'))) {
+      const fallback = { ...reqBody }
+      delete fallback.temperature
+      delete fallback.seed
+      resp = await callApi(fallback)
+    }
+  }
 
   if (!resp.ok) {
     const txt = await resp.text().catch(() => '')
@@ -270,9 +288,20 @@ function normalizeTier(t: any): string {
   return 'Tier 2'
 }
 
+// Severity is FIXED by evidence tier so the same submission scores the same
+// every time (deterministic). The model only chooses the tier; the server
+// assigns severity from this table — it is the single source of truth.
+const TIER_SEVERITY: Record<string, number> = {
+  'Tier 1': 10,
+  'Tier 2': 8,
+  'Tier 3': 5,
+  'Tier 4': 3,
+  GAP: 0,
+}
+
 // Defensive normalization + AUTHORITATIVE re-computation of the official
-// InvestSafe Pro explainable score (total ÷ max × 100), enforcing the
-// Evidence-Tier cap rule:  Tier 3/4 caps severity at 5;  GAP scores 0.
+// InvestSafe Pro explainable score (total ÷ max × 100). Severity is derived
+// solely from the evidence tier (see TIER_SEVERITY), making results repeatable.
 function normalizeResult(r: any) {
   let flags = Array.isArray(r.triggeredFlags) ? r.triggeredFlags : []
   flags = flags
@@ -281,17 +310,8 @@ function normalizeResult(r: any) {
       const def = FLAG_FRAMEWORK.find((d) => d.n === Number(f.n))
       const weight = def ? def.weight : Number(f.weight) || 5
       const tier = normalizeTier(f.evidenceTier)
-      let severity = clamp(Math.round(Number(f.severity)) || 0, 0, 10)
-
-      // Evidence-Tier cap rule
-      if (tier === 'GAP') {
-        severity = 0
-      } else if (tier === 'Tier 3' || tier === 'Tier 4') {
-        severity = Math.min(severity, 5)
-        if (severity < 1) severity = 1
-      } else {
-        if (severity < 1) severity = 1
-      }
+      // Severity is determined entirely by the tier — ignore the model's value.
+      const severity = TIER_SEVERITY[tier] ?? 0
 
       const weightedPoints = tier === 'GAP' ? 0 : Math.round((weight * severity) / 10)
       return {
