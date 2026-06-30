@@ -107,12 +107,14 @@
     const buf = await readAsArrayBuffer(file);
     const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
     let out = '';
-    const pages = Math.min(pdf.numPages, 200);
+    const pages = Math.min(pdf.numPages, 400);
     for (let i = 1; i <= pages; i++) {
       const page = await pdf.getPage(i);
       const content = await page.getTextContent();
       out += content.items.map((it) => it.str).join(' ') + '\n\n';
-      if (out.length > 150000) break; // ~plenty for the backend (caps at 120k)
+      // Backend analyzes the first ~120k chars (the stable sweet spot); pull a
+      // small margin beyond that so nothing meaningful is lost, then stop.
+      if (out.length > 150000) break;
     }
     return out.trim();
   }

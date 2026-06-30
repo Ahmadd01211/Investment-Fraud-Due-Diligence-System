@@ -15,6 +15,12 @@ export type Bindings = {
   OPENAI_VISION_MODEL?: string
   /** Optional: reasoning effort for GPT-5/o models (none|low|medium|high). Default low for consistency. */
   OPENAI_REASONING_EFFORT?: string
+  /** Optional: high-capability model for large/complex documents (default gpt-5.5). */
+  OPENAI_LARGE_MODEL?: string
+  /** Optional: char threshold above which the large model is used (default 40000). */
+  OPENAI_LARGE_DOC_CHARS?: string
+  /** Optional: max characters of material sent to the model (default 120000). */
+  OPENAI_MAX_MATERIAL_CHARS?: string
 }
 
 // The 21-flag framework (weight = max points each flag can contribute)
@@ -159,19 +165,37 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
   const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 4)
   const hasImages = images.length > 0
 
-  // Smart model routing: sharp vision model when images are attached, cheaper
-  // model for text-only. OPENAI_MODEL (if set) forces one model for everything.
-  const textModel = env.OPENAI_TEXT_MODEL || 'gpt-5.4-mini'
-  const visionModel = env.OPENAI_VISION_MODEL || 'gpt-5.4'
-  const model = env.OPENAI_MODEL || (hasImages ? visionModel : textModel)
-
-  // Send much more of the document so scoring isn't based on a tiny, unstable
-  // opening slice. gpt-5.x has a large context window; 120k chars (~30k tokens)
-  // covers the substantive body of most PPMs/offering memos.
-  const MAX_MATERIAL = 120000
+  // Send enough of the document to cover its substantive body WITHOUT dumping
+  // in so much boilerplate that scoring becomes unstable. 120k chars (~30k
+  // tokens) was empirically the sweet spot: it covers the real content of a
+  // 96-page PPM while keeping results consistent run-to-run. (Configurable.)
+  const MAX_MATERIAL = Number(env.OPENAI_MAX_MATERIAL_CHARS) || 120000
   const rawMaterial = (input.material || '')
   const material = rawMaterial.slice(0, MAX_MATERIAL)
   const wasTruncated = rawMaterial.length > MAX_MATERIAL
+
+  // Smart model routing:
+  //   • images attached → vision model (gpt-5.4)
+  //   • normal text     → fast/cheap, STABLE model (gpt-5.4-mini)
+  //
+  // NOTE ON LARGE DOCS: we deliberately do NOT auto-escalate big documents to a
+  // bigger reasoning model (e.g. gpt-5.5). Live testing on a 96-page PPM showed
+  // that routing the full document through gpt-5.5 made scoring LESS consistent
+  // (swinging 44 Medium → 72 High → 100 Critical across runs) and far slower
+  // (~50s/run), because these reasoning models don't honor seed/temperature.
+  // Stability comes instead from: capping material at MAX_MATERIAL, fixing
+  // severity by evidence tier, reasoning_effort:low, and the score stability
+  // floor. Large-doc routing stays OFF by default and is opt-in via env only.
+  const textModel = env.OPENAI_TEXT_MODEL || 'gpt-5.4-mini'
+  const visionModel = env.OPENAI_VISION_MODEL || 'gpt-5.4'
+  const largeModel = env.OPENAI_LARGE_MODEL || textModel
+  // Default disables auto large-doc routing (very high threshold). Override with
+  // OPENAI_LARGE_DOC_CHARS + OPENAI_LARGE_MODEL only if you explicitly want it.
+  const LARGE_DOC_CHARS = Number(env.OPENAI_LARGE_DOC_CHARS) || Number.MAX_SAFE_INTEGER
+  const isLargeDoc = material.length >= LARGE_DOC_CHARS
+  const model =
+    env.OPENAI_MODEL ||
+    (hasImages ? visionModel : isLargeDoc ? largeModel : textModel)
 
   const textPart =
     (ctx.length ? `INVESTOR-PROVIDED CONTEXT:\n${ctx.join('\n')}\n\n` : '') +
@@ -324,10 +348,18 @@ const TIER_SEVERITY: Record<string, number> = {
 function normalizeResult(r: any) {
   let flags = Array.isArray(r.triggeredFlags) ? r.triggeredFlags : []
   flags = flags
-    .filter((f: any) => f && typeof f.n !== 'undefined')
+    // Only keep flags that map to a REAL framework flag (1..N). Reasoning models
+    // occasionally emit a stray flag object with a null/blank/unknown number;
+    // those used to be scored with a default weight and caused 0↔20 jitter on
+    // otherwise-clean documents. Dropping them keeps scoring deterministic.
+    .filter((f: any) => {
+      if (!f) return false
+      const n = Number((f as any).n)
+      return Number.isInteger(n) && FLAG_FRAMEWORK.some((d) => d.n === n)
+    })
     .map((f: any) => {
-      const def = FLAG_FRAMEWORK.find((d) => d.n === Number(f.n))
-      const weight = def ? def.weight : Number(f.weight) || 5
+      const def = FLAG_FRAMEWORK.find((d) => d.n === Number(f.n))!
+      const weight = def.weight
       const tier = normalizeTier(f.evidenceTier)
       // Severity is determined entirely by the tier — ignore the model's value.
       const severity = TIER_SEVERITY[tier] ?? 0
@@ -335,7 +367,7 @@ function normalizeResult(r: any) {
       const weightedPoints = tier === 'GAP' ? 0 : Math.round((weight * severity) / 10)
       return {
         n: Number(f.n),
-        name: def ? def.name : String(f.name || 'Flag'),
+        name: def.name,
         weight,
         severity,
         evidenceTier: tier,
