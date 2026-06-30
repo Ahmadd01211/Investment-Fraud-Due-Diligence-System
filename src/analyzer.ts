@@ -7,8 +7,12 @@
 export type Bindings = {
   OPENAI_API_KEY: string
   OPENAI_BASE_URL: string
-  /** Optional: override the model name. Defaults to a real OpenAI model. */
+  /** Optional: force ONE model for everything (overrides text/vision split). */
   OPENAI_MODEL?: string
+  /** Optional: model for text-only submissions (default gpt-4o-mini, cheap). */
+  OPENAI_TEXT_MODEL?: string
+  /** Optional: model for submissions WITH images (default gpt-4o, sharp vision). */
+  OPENAI_VISION_MODEL?: string
 }
 
 // The 21-flag framework (weight = max points each flag can contribute)
@@ -127,9 +131,6 @@ export interface AnalyzeInput {
 export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
   const apiKey = env.OPENAI_API_KEY
   const baseUrl = (env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '')
-  // Model is configurable so you can use any OpenAI-compatible provider/model.
-  // Default targets real OpenAI (gpt-4o-mini = cheap + vision-capable).
-  const model = env.OPENAI_MODEL || 'gpt-4o-mini'
 
   if (!apiKey) {
     throw new Error('Analysis service is not configured. (Missing server API key.)')
@@ -144,6 +145,12 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
 
   const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 4)
   const hasImages = images.length > 0
+
+  // Smart model routing: sharp vision model when images are attached, cheaper
+  // model for text-only. OPENAI_MODEL (if set) forces one model for everything.
+  const textModel = env.OPENAI_TEXT_MODEL || 'gpt-4o-mini'
+  const visionModel = env.OPENAI_VISION_MODEL || 'gpt-4o'
+  const model = env.OPENAI_MODEL || (hasImages ? visionModel : textModel)
 
   const textPart =
     (ctx.length ? `INVESTOR-PROVIDED CONTEXT:\n${ctx.join('\n')}\n\n` : '') +

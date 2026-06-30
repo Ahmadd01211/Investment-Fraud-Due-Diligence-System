@@ -111,17 +111,24 @@ curl http://localhost:3000          # smoke test
 The app calls any **OpenAI-compatible** Chat Completions API. Configure it once on the
 backend; end users never enter a key. Three env vars control it:
 
-| Var | Purpose | Example |
+| Var | Purpose | Default |
 |-----|---------|---------|
-| `OPENAI_API_KEY` | your provider secret | `sk-...` |
-| `OPENAI_BASE_URL` | API base (default `https://api.openai.com/v1`) | `https://api.openai.com/v1` |
-| `OPENAI_MODEL` | model name (default `gpt-4o-mini`, vision-capable) | `gpt-4o-mini` |
+| `OPENAI_API_KEY` | your provider secret | (required) |
+| `OPENAI_BASE_URL` | API base | `https://api.openai.com/v1` |
+| `OPENAI_TEXT_MODEL` | model for text-only submissions (cheap) | `gpt-4o-mini` |
+| `OPENAI_VISION_MODEL` | model for submissions **with images** (sharp vision) | `gpt-4o` |
+| `OPENAI_MODEL` | optional — force ONE model for everything (overrides the split) | _(unset)_ |
+
+**Smart model routing:** when the user attaches an image/screenshot the app uses
+`OPENAI_VISION_MODEL` (default `gpt-4o`, sharper vision); plain-text submissions use
+the cheaper `OPENAI_TEXT_MODEL` (`gpt-4o-mini`). Set `OPENAI_MODEL` to force one model.
 
 For local dev, put them in `.dev.vars` (git-ignored):
 ```
 OPENAI_API_KEY=sk-your-openai-key
 OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=gpt-4o-mini
+OPENAI_TEXT_MODEL=gpt-4o-mini
+OPENAI_VISION_MODEL=gpt-4o
 ```
 Works with OpenAI, OpenRouter, Together, Groq, Azure OpenAI, etc. — just set the
 matching `OPENAI_BASE_URL` and `OPENAI_MODEL`.
@@ -133,7 +140,8 @@ The backend key is a **secret** in production (do not commit it):
 npx wrangler pages project create investsafe-pro --production-branch main
 npx wrangler pages secret put OPENAI_API_KEY --project-name investsafe-pro
 npx wrangler pages secret put OPENAI_BASE_URL --project-name investsafe-pro
-npx wrangler pages secret put OPENAI_MODEL --project-name investsafe-pro
+npx wrangler pages secret put OPENAI_TEXT_MODEL --project-name investsafe-pro
+npx wrangler pages secret put OPENAI_VISION_MODEL --project-name investsafe-pro
 
 # deploy
 npm run deploy
