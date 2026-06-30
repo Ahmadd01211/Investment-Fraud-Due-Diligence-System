@@ -80,8 +80,16 @@ IMPORTANT ANALYSIS GUIDANCE:
 - High-pressure / "closing soon" / "limited spots" urgency is a flag.
 - Be fair: if the material is well-disclosed, conservative, and registered, return a LOW score with few/no flags. Do not invent fraud where there is none.
 
+RELEVANCE GATE (do this FIRST, before scoring):
+- First determine whether the submitted material (text AND/OR any attached image) is actually about an INVESTMENT, financial offering, fund, securities, business opportunity, money-making scheme, or a solicitation to invest/send money.
+- A random photo (e.g. a couple, a landscape, a meme, a pet), a screenshot of unrelated content, an empty/blank image, or text that has nothing to do with investing is NOT investment-related.
+- If the material is NOT investment-related, set "isInvestmentRelated": false and "notRelevantReason" to a short plain-English explanation of what you actually see (e.g. "This appears to be a personal photo of two people, not an investment offering."). In that case you may leave the scoring fields at their defaults (riskScore 0, empty arrays) — they will be ignored.
+- Only if the material IS investment-related, set "isInvestmentRelated": true and perform the full 21-flag scoring below.
+
 You must respond with ONLY a single valid JSON object (no markdown fences, no commentary) in EXACTLY this shape:
 {
+  "isInvestmentRelated": <true | false>,
+  "notRelevantReason": "<if isInvestmentRelated is false: short plain-English description of what the submission actually appears to be; otherwise empty string>",
   "riskScore": <integer 0-100, computed with the official formula above>,
   "riskLevel": "Low" | "Medium" | "High" | "Critical",
   "scoreBreakdown": {
@@ -237,6 +245,13 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
     } catch {
       throw new Error('Could not parse the analysis result.')
     }
+  }
+
+  // Relevance gate: if the model decided this isn't an investment at all,
+  // do NOT return a misleading "0 / Low risk" score. Signal a clear error.
+  if (parsed && parsed.isInvestmentRelated === false) {
+    const reason = String(parsed.notRelevantReason || '').trim()
+    throw new Error('NOT_RELEVANT:' + (reason || 'This does not appear to be an investment offering, pitch, or solicitation.'))
   }
 
   return normalizeResult(parsed)

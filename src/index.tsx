@@ -41,6 +41,19 @@ app.post('/api/analyze', async (c) => {
     return c.json({ ok: true, result })
   } catch (err: any) {
     const raw = (err?.message || '').toString()
+    if (raw.startsWith('NOT_RELEVANT:')) {
+      const reason = raw.slice('NOT_RELEVANT:'.length).trim()
+      return c.json(
+        {
+          error: 'invalid_submission',
+          title: "This doesn't look like an investment",
+          message:
+            (reason ? reason + ' ' : '') +
+            'InvestSafe Pro analyzes investment offerings, pitches, ads, emails, or documents (PPMs, fund decks, etc.). Please paste the investment details or attach a document/screenshot of the offer you want checked.',
+        },
+        422
+      )
+    }
     if (raw.startsWith('SERVICE_QUOTA:')) {
       return c.json(
         { error: 'The analysis service is temporarily unavailable (the shared AI credits have run out). This is on our side, not your submission — please try again later.' },

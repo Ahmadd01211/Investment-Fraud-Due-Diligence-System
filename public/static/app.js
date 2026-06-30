@@ -243,10 +243,27 @@
   $('#sampleBtn').addEventListener('click', () => loadSample(SAMPLES[0]));
 
   /* ── state switching ── */
+  const EMPTY_DEFAULT_HTML = resultsEmpty.innerHTML;
   function showState(state) {
     resultsEmpty.hidden = state !== 'empty';
     resultsLoading.hidden = state !== 'loading';
     resultsContent.hidden = state !== 'content';
+    // Restore the default empty-state prompt whenever we leave a notice.
+    if (state !== 'empty') resultsEmpty.innerHTML = EMPTY_DEFAULT_HTML;
+  }
+
+  // Friendly "this isn't an investment" notice (replaces the empty-state prompt).
+  function showNotice(title, message) {
+    resultsEmpty.innerHTML = `
+      <div class="empty-ico notice"><i class="fas fa-circle-exclamation"></i></div>
+      <h3>${esc(title)}</h3>
+      <p>${esc(message)}</p>
+      <button class="mini-btn" type="button" id="noticeOk"><i class="fas fa-rotate-left"></i> Try a different submission</button>`;
+    resultsEmpty.hidden = false;
+    resultsLoading.hidden = true;
+    resultsContent.hidden = true;
+    const ok = $('#noticeOk');
+    if (ok) ok.addEventListener('click', () => { resultsEmpty.innerHTML = EMPTY_DEFAULT_HTML; material.focus(); });
   }
 
   /* ── analyze ── */
@@ -278,7 +295,16 @@
     try {
       const res = await fetch('/api/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       const data = await res.json();
-      if (!res.ok || data.error) throw new Error(data.error || 'Analysis failed.');
+      if (!res.ok || data.error) {
+        // Special case: the submission isn't an investment at all.
+        if (data && data.error === 'invalid_submission') {
+          showState('empty');
+          showNotice(data.title || "This doesn't look like an investment", data.message || 'Please submit an investment offering, pitch, ad, email, or document.');
+          toast('Not an investment — nothing to analyze', 'err');
+          return;
+        }
+        throw new Error((data && (data.message || data.error)) || 'Analysis failed.');
+      }
       renderResult(data.result);
       showState('content');
       toast('Report ready', 'ok');
