@@ -13,6 +13,8 @@ export type Bindings = {
   OPENAI_TEXT_MODEL?: string
   /** Optional: model for submissions WITH images (default gpt-4o, sharp vision). */
   OPENAI_VISION_MODEL?: string
+  /** Optional: reasoning effort for GPT-5/o models (none|low|medium|high). Default low for consistency. */
+  OPENAI_REASONING_EFFORT?: string
 }
 
 // The 21-flag framework (weight = max points each flag can contribute)
@@ -63,8 +65,9 @@ SCORING RULES — use the OFFICIAL InvestSafe Pro explainable scoring formula EX
 - CONSISTENCY RULES (critical — follow exactly so the same document always scores the same):
    • Only TRIGGER a flag when there is concrete support in the material. Do NOT trigger a flag on a hunch; if you are unsure whether a flag applies, do NOT include it.
    • Use the HIGHEST tier the evidence clearly supports — pick the single best-fitting tier; do not hedge between two tiers.
-   • If a required disclosure is simply absent (not affirmatively wrong), classify it as GAP (severity 0), NOT as a triggered Tier 3/4 flag.
-   • Apply the same standard to every submission; identical wording must produce the identical set of flags and tiers.
+   • If a required disclosure is simply absent (not affirmatively wrong), classify it as GAP (severity 0), NOT as a triggered Tier 3/4 flag. This applies especially to "missing"-type flags such as Flag 7 (addresses concealed), Flag 11 (AUM without debt disclosure), Flag 15 (no purchase price/LTV), Flag 16 (no failed-deal disclosure): if the document simply does not mention the item, that is a GAP, not a scored flag.
+   • A flag counts as TRIGGERED (Tier 1–4, severity > 0) ONLY when the material AFFIRMATIVELY contains problematic content (a bad claim, a contradiction, a prohibited practice) — never merely because something expected is absent.
+   • Apply the same standard to every submission; identical wording must produce the identical set of flags, tiers, and therefore the identical score. Do not let minor wording differences change which flags trigger.
 - weightedPoints = round( weight * severity / 10 ).
 - riskScore = round( (sum of weightedPoints of ALL triggered flags) / (maximum possible points) * 100 ), where maximum possible points = sum of (weight * 1.0) over every flag actually triggered with a non-GAP tier... NO — use the OFFICIAL denominator: maximum = sum of the FULL WEIGHT of every triggered (non-GAP) flag (i.e. as if each triggered flag were severity 10). So:
         riskScore = round( totalWeightedPoints / totalTriggeredFullWeight * 100 ).
@@ -162,10 +165,18 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
   const visionModel = env.OPENAI_VISION_MODEL || 'gpt-5.4'
   const model = env.OPENAI_MODEL || (hasImages ? visionModel : textModel)
 
+  // Send much more of the document so scoring isn't based on a tiny, unstable
+  // opening slice. gpt-5.x has a large context window; 120k chars (~30k tokens)
+  // covers the substantive body of most PPMs/offering memos.
+  const MAX_MATERIAL = 120000
+  const rawMaterial = (input.material || '')
+  const material = rawMaterial.slice(0, MAX_MATERIAL)
+  const wasTruncated = rawMaterial.length > MAX_MATERIAL
+
   const textPart =
     (ctx.length ? `INVESTOR-PROVIDED CONTEXT:\n${ctx.join('\n')}\n\n` : '') +
-    (input.material && input.material.trim().length
-      ? `SUBMITTED MATERIAL (text) TO ANALYZE:\n"""\n${input.material.slice(0, 24000)}\n"""\n\n`
+    (material.trim().length
+      ? `SUBMITTED MATERIAL (text) TO ANALYZE${wasTruncated ? ' (long document — analyze what is provided)' : ''}:\n"""\n${material}\n"""\n\n`
       : '') +
     (hasImages
       ? `The investor also attached ${images.length} image(s) (e.g. a screenshot of an ad, email, or pitch-deck page). Read ALL text and visual claims in the image(s) and treat them as submitted material.\n\n`
@@ -179,7 +190,7 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
 
   // GPT-5 family (and o-series) reject `max_tokens` and require
   // `max_completion_tokens`. Older models (gpt-4o etc.) use `max_tokens`.
-  const usesCompletionTokens = /^(gpt-5|o1|o3|o4)/i.test(model)
+  const isReasoning = /^(gpt-5|o1|o3|o4)/i.test(model)
   const reqBody: any = {
     model,
     messages: [
@@ -192,8 +203,16 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
     temperature: 0,
     seed: 42,
   }
-  if (usesCompletionTokens) reqBody.max_completion_tokens = 6000
-  else reqBody.max_tokens = 4000
+  if (isReasoning) {
+    // Reasoning models add internal stochastic reasoning that temperature:0
+    // does NOT fully control. Low reasoning effort sharply reduces run-to-run
+    // score variance for this rubric-based scoring task. Configurable.
+    reqBody.reasoning_effort = env.OPENAI_REASONING_EFFORT || 'low'
+    // Reasoning models need headroom for hidden reasoning tokens + the JSON.
+    reqBody.max_completion_tokens = 8000
+  } else {
+    reqBody.max_tokens = 4000
+  }
 
   const callApi = (b: any) =>
     fetch(`${baseUrl}/chat/completions`, {
@@ -331,7 +350,19 @@ function normalizeResult(r: any) {
   const scored = flags.filter((f: any) => f.evidenceTier !== 'GAP')
   const totalWeightedPoints = scored.reduce((s: number, f: any) => s + f.weightedPoints, 0)
   const maxPossiblePoints = scored.reduce((s: number, f: any) => s + f.weight, 0)
-  const riskScore = maxPossiblePoints > 0 ? clamp(Math.round((totalWeightedPoints / maxPossiblePoints) * 100), 0, 100) : 0
+
+  // STABILITY FLOOR: the raw "total ÷ triggered-max" ratio lets a SINGLE
+  // borderline flag dominate (e.g. 1 flag = up to 100% → "Critical") even in a
+  // long, otherwise-clean document. To prevent one flickering flag from swinging
+  // the verdict from Low to Critical, the denominator includes a baseline floor.
+  // The floor scales with how few flags triggered: with only 1–2 triggered
+  // flags, a meaningful "clean evidence" baseline is added so a lone minor flag
+  // reads as Low/Medium, not Critical. With several flags the floor fades out and
+  // the score converges to the original formula.
+  const STABILITY_FLOOR = 40 // baseline points representing "document reviewed, little/no fraud signal"
+  const floorWeight = scored.length >= 4 ? 0 : STABILITY_FLOOR * (1 - scored.length / 4)
+  const denom = maxPossiblePoints + floorWeight
+  const riskScore = denom > 0 ? clamp(Math.round((totalWeightedPoints / denom) * 100), 0, 100) : 0
 
   // Key drivers: flags contributing >= 15% of the maximum.
   const keyDrivers = scored

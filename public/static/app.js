@@ -107,12 +107,12 @@
     const buf = await readAsArrayBuffer(file);
     const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
     let out = '';
-    const pages = Math.min(pdf.numPages, 40);
+    const pages = Math.min(pdf.numPages, 200);
     for (let i = 1; i <= pages; i++) {
       const page = await pdf.getPage(i);
       const content = await page.getTextContent();
       out += content.items.map((it) => it.str).join(' ') + '\n\n';
-      if (out.length > 40000) break;
+      if (out.length > 150000) break; // ~plenty for the backend (caps at 120k)
     }
     return out.trim();
   }
@@ -127,7 +127,7 @@
     const t = String(text || '').trim();
     if (!t) return false;
     const prefix = material.value.trim() ? material.value.trimEnd() + '\n\n' : '';
-    material.value = (prefix + (label ? `--- ${label} ---\n` : '') + t).slice(0, 60000);
+    material.value = (prefix + (label ? `--- ${label} ---\n` : '') + t).slice(0, 150000);
     updateCount();
     return true;
   }

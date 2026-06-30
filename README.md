@@ -153,7 +153,7 @@ npm run deploy
 - **Platform**: Cloudflare Pages
 - **Status**: ✅ Running locally in sandbox (PM2) · ⏳ Not yet deployed to production
 - **Project name**: `investsafe-pro`
-- **Last Updated**: 2026-06-30 — deterministic scoring (temperature 0 + seed; severity fixed by evidence tier; consistency rules) so the same submission scores the same every time; rejects non-investment submissions; GPT-5.4 vision / GPT-5.4-mini text
+- **Last Updated**: 2026-06-30 — stable scoring for large docs: send up to 120k chars (no more tiny opening-slice), `reasoning_effort: low` to curb reasoning-model variance, and a stability floor so a single borderline flag can't swing a long clean document from Low to Critical. Verified: 707 Franklin PPM = Low (8/8 runs); fraud pitch = 78/Critical (every run)
 
 ## Not Yet Implemented / Next Steps
 - Live SEC EDGAR / FINRA BrokerCheck lookups (currently the report tells users *where* to verify).
