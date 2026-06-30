@@ -40,7 +40,23 @@ app.post('/api/analyze', async (c) => {
     })
     return c.json({ ok: true, result })
   } catch (err: any) {
-    return c.json({ error: err?.message || 'Something went wrong while analyzing. Please try again.' }, 500)
+    const raw = (err?.message || '').toString()
+    if (raw.startsWith('SERVICE_QUOTA:')) {
+      return c.json(
+        { error: 'The analysis service is temporarily unavailable (the shared AI credits have run out). This is on our side, not your submission — please try again later.' },
+        503
+      )
+    }
+    if (raw.startsWith('RESPONSE_TRUNCATED:')) {
+      return c.json(
+        { error: 'This document is very large, so the analysis was cut off before finishing. Please paste or attach just the key pages (e.g. the summary, terms, and return claims) and try again.' },
+        400
+      )
+    }
+    if (raw.startsWith('SERVICE_MESSAGE:')) {
+      return c.json({ error: 'The analysis service returned an unexpected response. Please try again in a moment.' }, 502)
+    }
+    return c.json({ error: raw || 'Something went wrong while analyzing. Please try again.' }, 500)
   }
 })
 

@@ -179,15 +179,38 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
 
   const data: any = await resp.json()
   const content = data?.choices?.[0]?.message?.content
+  const finish = data?.choices?.[0]?.finish_reason
   if (!content) throw new Error('Analysis service returned an empty response.')
+
+  // The LLM proxy can return a plain-text status/error message (e.g. quota /
+  // credits exhausted) with HTTP 200 instead of JSON. Detect that up front so
+  // we surface a meaningful error rather than a confusing "could not parse".
+  const trimmed = String(content).trim()
+  const looksLikeJson = trimmed.startsWith('{') || trimmed.startsWith('[') || /\{[\s\S]*\}/.test(trimmed)
+  if (!looksLikeJson) {
+    const lower = trimmed.toLowerCase()
+    if (lower.includes('credit') && (lower.includes('deplet') || lower.includes('purchase') || lower.includes('pack'))) {
+      throw new Error('SERVICE_QUOTA: The analysis service is temporarily unavailable (account credits depleted). Please try again later or contact support.')
+    }
+    throw new Error(`SERVICE_MESSAGE: ${trimmed.slice(0, 300)}`)
+  }
+
+  // If the model was cut off mid-output, the JSON will be invalid.
+  if (finish === 'length') {
+    throw new Error('RESPONSE_TRUNCATED: The document is very large and the analysis was cut off. Try a shorter excerpt or the key pages.')
+  }
 
   let parsed: any
   try {
-    parsed = JSON.parse(content)
+    parsed = JSON.parse(trimmed)
   } catch {
-    const m = content.match(/\{[\s\S]*\}/)
+    const m = trimmed.match(/\{[\s\S]*\}/)
     if (!m) throw new Error('Could not parse the analysis result.')
-    parsed = JSON.parse(m[0])
+    try {
+      parsed = JSON.parse(m[0])
+    } catch {
+      throw new Error('Could not parse the analysis result.')
+    }
   }
 
   return normalizeResult(parsed)
