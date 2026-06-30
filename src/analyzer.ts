@@ -7,6 +7,8 @@
 export type Bindings = {
   OPENAI_API_KEY: string
   OPENAI_BASE_URL: string
+  /** Optional: override the model name. Defaults to a real OpenAI model. */
+  OPENAI_MODEL?: string
 }
 
 // The 21-flag framework (weight = max points each flag can contribute)
@@ -124,7 +126,10 @@ export interface AnalyzeInput {
 
 export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
   const apiKey = env.OPENAI_API_KEY
-  const baseUrl = (env.OPENAI_BASE_URL || 'https://www.genspark.ai/api/llm_proxy/v1').replace(/\/$/, '')
+  const baseUrl = (env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '')
+  // Model is configurable so you can use any OpenAI-compatible provider/model.
+  // Default targets real OpenAI (gpt-4o-mini = cheap + vision-capable).
+  const model = env.OPENAI_MODEL || 'gpt-4o-mini'
 
   if (!apiKey) {
     throw new Error('Analysis service is not configured. (Missing server API key.)')
@@ -162,18 +167,27 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      // gpt-5-mini supports vision; use it for both text and image inputs.
-      model: 'gpt-5-mini',
+      // gpt-4o-mini (default) supports vision; works for both text and images.
+      model,
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: userContent },
       ],
       response_format: { type: 'json_object' },
+      max_tokens: 4000,
     }),
   })
 
   if (!resp.ok) {
     const txt = await resp.text().catch(() => '')
+    const low = txt.toLowerCase()
+    // Provider quota / billing problems (OpenAI returns 429 with these).
+    if (resp.status === 429 || low.includes('insufficient_quota') || low.includes('exceeded your current quota') || low.includes('billing')) {
+      throw new Error('SERVICE_QUOTA: The analysis service is temporarily unavailable (API quota/billing limit reached).')
+    }
+    if (resp.status === 401 || resp.status === 403) {
+      throw new Error('SERVICE_AUTH: The analysis service is misconfigured (invalid API key).')
+    }
     throw new Error(`Analysis service error (${resp.status}). ${txt.slice(0, 200)}`)
   }
 

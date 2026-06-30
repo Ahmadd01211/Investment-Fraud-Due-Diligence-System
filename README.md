@@ -107,11 +107,24 @@ npm run build                       # build to dist/
 pm2 start ecosystem.config.cjs      # serve via wrangler pages dev on :3000
 curl http://localhost:3000          # smoke test
 ```
-The API key for local dev lives in `.dev.vars` (git-ignored):
+### Backend AI key (NO BYOK — you provide ONE key for all users)
+The app calls any **OpenAI-compatible** Chat Completions API. Configure it once on the
+backend; end users never enter a key. Three env vars control it:
+
+| Var | Purpose | Example |
+|-----|---------|---------|
+| `OPENAI_API_KEY` | your provider secret | `sk-...` |
+| `OPENAI_BASE_URL` | API base (default `https://api.openai.com/v1`) | `https://api.openai.com/v1` |
+| `OPENAI_MODEL` | model name (default `gpt-4o-mini`, vision-capable) | `gpt-4o-mini` |
+
+For local dev, put them in `.dev.vars` (git-ignored):
 ```
-OPENAI_API_KEY=<token>
-OPENAI_BASE_URL=https://www.genspark.ai/api/llm_proxy/v1
+OPENAI_API_KEY=sk-your-openai-key
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4o-mini
 ```
+Works with OpenAI, OpenRouter, Together, Groq, Azure OpenAI, etc. — just set the
+matching `OPENAI_BASE_URL` and `OPENAI_MODEL`.
 
 ## Deployment (Cloudflare Pages)
 The backend key is a **secret** in production (do not commit it):
@@ -120,6 +133,7 @@ The backend key is a **secret** in production (do not commit it):
 npx wrangler pages project create investsafe-pro --production-branch main
 npx wrangler pages secret put OPENAI_API_KEY --project-name investsafe-pro
 npx wrangler pages secret put OPENAI_BASE_URL --project-name investsafe-pro
+npx wrangler pages secret put OPENAI_MODEL --project-name investsafe-pro
 
 # deploy
 npm run deploy
@@ -129,7 +143,7 @@ npm run deploy
 - **Platform**: Cloudflare Pages
 - **Status**: ✅ Running locally in sandbox (PM2) · ⏳ Not yet deployed to production
 - **Project name**: `investsafe-pro`
-- **Last Updated**: 2026-06-18 — added PDF / image / Word / text attachment support (incl. vision-model image analysis)
+- **Last Updated**: 2026-06-30 — provider-agnostic backend key (bring-your-own OpenAI/compatible key via `OPENAI_API_KEY`/`OPENAI_BASE_URL`/`OPENAI_MODEL`); clearer quota/auth error messages
 
 ## Not Yet Implemented / Next Steps
 - Live SEC EDGAR / FINRA BrokerCheck lookups (currently the report tells users *where* to verify).

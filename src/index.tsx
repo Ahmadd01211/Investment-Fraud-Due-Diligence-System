@@ -53,6 +53,9 @@ app.post('/api/analyze', async (c) => {
         400
       )
     }
+    if (raw.startsWith('SERVICE_AUTH:')) {
+      return c.json({ error: 'The analysis service is not configured correctly (server API key issue). Please contact the site owner.' }, 503)
+    }
     if (raw.startsWith('SERVICE_MESSAGE:')) {
       return c.json({ error: 'The analysis service returned an unexpected response. Please try again in a moment.' }, 502)
     }
