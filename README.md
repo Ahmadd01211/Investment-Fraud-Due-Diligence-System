@@ -115,20 +115,22 @@ backend; end users never enter a key. Three env vars control it:
 |-----|---------|---------|
 | `OPENAI_API_KEY` | your provider secret | (required) |
 | `OPENAI_BASE_URL` | API base | `https://api.openai.com/v1` |
-| `OPENAI_TEXT_MODEL` | model for text-only submissions (cheap) | `gpt-4o-mini` |
-| `OPENAI_VISION_MODEL` | model for submissions **with images** (sharp vision) | `gpt-4o` |
+| `OPENAI_TEXT_MODEL` | model for text-only submissions (cheap) | `gpt-5.4-mini` |
+| `OPENAI_VISION_MODEL` | model for submissions **with images** (sharp vision) | `gpt-5.4` |
 | `OPENAI_MODEL` | optional — force ONE model for everything (overrides the split) | _(unset)_ |
 
 **Smart model routing:** when the user attaches an image/screenshot the app uses
-`OPENAI_VISION_MODEL` (default `gpt-4o`, sharper vision); plain-text submissions use
-the cheaper `OPENAI_TEXT_MODEL` (`gpt-4o-mini`). Set `OPENAI_MODEL` to force one model.
+`OPENAI_VISION_MODEL` (default `gpt-5.4`, sharper vision); plain-text submissions use
+the cheaper `OPENAI_TEXT_MODEL` (`gpt-5.4-mini`). Set `OPENAI_MODEL` to force one model.
+The code auto-selects `max_completion_tokens` for GPT-5/o-series models and
+`max_tokens` for older models (gpt-4o).
 
 For local dev, put them in `.dev.vars` (git-ignored):
 ```
 OPENAI_API_KEY=sk-your-openai-key
 OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_TEXT_MODEL=gpt-4o-mini
-OPENAI_VISION_MODEL=gpt-4o
+OPENAI_TEXT_MODEL=gpt-5.4-mini
+OPENAI_VISION_MODEL=gpt-5.4
 ```
 Works with OpenAI, OpenRouter, Together, Groq, Azure OpenAI, etc. — just set the
 matching `OPENAI_BASE_URL` and `OPENAI_MODEL`.
@@ -151,7 +153,7 @@ npm run deploy
 - **Platform**: Cloudflare Pages
 - **Status**: ✅ Running locally in sandbox (PM2) · ⏳ Not yet deployed to production
 - **Project name**: `investsafe-pro`
-- **Last Updated**: 2026-06-30 — provider-agnostic backend key (bring-your-own OpenAI/compatible key via `OPENAI_API_KEY`/`OPENAI_BASE_URL`/`OPENAI_MODEL`); clearer quota/auth error messages
+- **Last Updated**: 2026-06-30 — wired to OpenAI GPT-5.4 (vision) / GPT-5.4-mini (text) with smart routing; fixed GPT-5 `max_completion_tokens` requirement; verified live on real PPM (707 Franklin → 36/Medium)
 
 ## Not Yet Implemented / Next Steps
 - Live SEC EDGAR / FINRA BrokerCheck lookups (currently the report tells users *where* to verify).

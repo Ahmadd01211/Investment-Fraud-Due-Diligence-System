@@ -148,8 +148,8 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
 
   // Smart model routing: sharp vision model when images are attached, cheaper
   // model for text-only. OPENAI_MODEL (if set) forces one model for everything.
-  const textModel = env.OPENAI_TEXT_MODEL || 'gpt-4o-mini'
-  const visionModel = env.OPENAI_VISION_MODEL || 'gpt-4o'
+  const textModel = env.OPENAI_TEXT_MODEL || 'gpt-5.4-mini'
+  const visionModel = env.OPENAI_VISION_MODEL || 'gpt-5.4'
   const model = env.OPENAI_MODEL || (hasImages ? visionModel : textModel)
 
   const textPart =
@@ -167,22 +167,27 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
     ? [{ type: 'text', text: textPart }, ...images.map((url) => ({ type: 'image_url', image_url: { url } }))]
     : textPart
 
+  // GPT-5 family (and o-series) reject `max_tokens` and require
+  // `max_completion_tokens`. Older models (gpt-4o etc.) use `max_tokens`.
+  const usesCompletionTokens = /^(gpt-5|o1|o3|o4)/i.test(model)
+  const reqBody: any = {
+    model,
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: userContent },
+    ],
+    response_format: { type: 'json_object' },
+  }
+  if (usesCompletionTokens) reqBody.max_completion_tokens = 6000
+  else reqBody.max_tokens = 4000
+
   const resp = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`,
     },
-    body: JSON.stringify({
-      // gpt-4o-mini (default) supports vision; works for both text and images.
-      model,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userContent },
-      ],
-      response_format: { type: 'json_object' },
-      max_tokens: 4000,
-    }),
+    body: JSON.stringify(reqBody),
   })
 
   if (!resp.ok) {
