@@ -129,7 +129,7 @@ export function PricingPage(): string {
     <a href="/#how">How it works</a>
     <a href="/#methodology">Methodology</a>
     <a href="/pricing" class="active">Pricing</a>
-    <a href="/pricing#one-time">Research</a>
+    <a href="/premium">Premium</a>
     <a class="nav-cta" href="/#analyze"><i class="fas fa-magnifying-glass-chart"></i> Check a pitch</a>
   </nav>
 </header>

@@ -3,7 +3,16 @@ import { cors } from 'hono/cors'
 import { analyzeSubmission, FLAG_FRAMEWORK, type Bindings } from './analyzer'
 import { HomePage } from './page'
 import { PricingPage } from './pricing'
-import { PLANS, ONE_TIME_OFFERINGS, CURRENCY } from './plans'
+import { PremiumPage } from './premium'
+import {
+  PLANS,
+  ONE_TIME_OFFERINGS,
+  CURRENCY,
+  PREMIUM_AUDIENCES,
+  SERVICE_TIERS,
+  ADDON_SERVICES,
+  VALUATION_CARDS,
+} from './plans'
 
 const app = new Hono<{ Bindings: Bindings }>()
 
@@ -91,5 +100,19 @@ app.get('/', (c) => c.html(HomePage()))
 
 // ── Memberships / pricing page ──
 app.get('/pricing', (c) => c.html(PricingPage()))
+
+// ── API: premium services (tiers, à la carte add-ons, valuation) ──
+app.get('/api/premium', (c) =>
+  c.json({
+    currency: CURRENCY,
+    audiences: PREMIUM_AUDIENCES,
+    serviceTiers: SERVICE_TIERS,
+    addOns: ADDON_SERVICES,
+    valuation: VALUATION_CARDS,
+  })
+)
+
+// ── Premium Services page ──
+app.get('/premium', (c) => c.html(PremiumPage()))
 
 export default app
