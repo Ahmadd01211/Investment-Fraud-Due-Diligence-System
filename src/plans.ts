@@ -22,6 +22,25 @@ export interface Plan {
   features: string[]
 }
 
+// One-time, pay-as-you-go services (NOT a recurring membership). These are
+// standalone products a customer can buy once — e.g. a hands-on title/records
+// research report or an expert deep-dive on a single deal.
+export interface OneTimeOffering {
+  id: string
+  name: string
+  tagline: string
+  /** One-time price in whole currency units (USD). null = quoted per job. */
+  price: number | null
+  priceFrom?: boolean // show "from $X" when the final price varies
+  currency: string
+  icon: string // FontAwesome class
+  turnaround: string // e.g. "2–3 business days"
+  badge?: string
+  featured?: boolean
+  cta: string
+  includes: string[]
+}
+
 export const CURRENCY = 'USD'
 
 export const PLANS: Plan[] = [
@@ -106,3 +125,68 @@ export const PLANS: Plan[] = [
     ],
   },
 ]
+
+// ─────────────────────────────────────────────────────────────
+// One-time offerings (buy once — no subscription required)
+// ─────────────────────────────────────────────────────────────
+export const ONE_TIME_OFFERINGS: OneTimeOffering[] = [
+  {
+    id: 'title-research',
+    name: 'Title & Property Research Report',
+    tagline: 'Verify the real estate behind the pitch — ownership, liens & value.',
+    price: 149,
+    priceFrom: true,
+    currency: CURRENCY,
+    icon: 'fa-house-circle-check',
+    turnaround: '2–3 business days',
+    badge: 'Most requested',
+    featured: true,
+    cta: 'Order title research',
+    includes: [
+      'County title & deed / ownership verification',
+      'Recorded liens, mortgages & encumbrances check',
+      'Actual purchase price vs. claimed value',
+      'Loan-to-value (LTV) reality check',
+      'Cross-check against the sponsor\u2019s claims',
+      'Plain-English written summary + source documents',
+    ],
+  },
+  {
+    id: 'sponsor-background',
+    name: 'Sponsor & Promoter Background Check',
+    tagline: 'Who\u2019s really running the deal — regulatory & litigation history.',
+    price: 129,
+    currency: CURRENCY,
+    icon: 'fa-user-magnifying-glass',
+    turnaround: '2–4 business days',
+    cta: 'Order background check',
+    includes: [
+      'SEC EDGAR & enforcement-action search',
+      'FINRA BrokerCheck & IAPD lookup',
+      'Litigation, judgments & bankruptcy scan',
+      'Prior failed-deal / entity history',
+      'State registration & licensing verification',
+      'Consolidated risk summary report',
+    ],
+  },
+  {
+    id: 'deep-dive',
+    name: 'Expert Deep-Dive Review',
+    tagline: 'A human analyst reviews one full offering, end to end.',
+    price: 299,
+    priceFrom: true,
+    currency: CURRENCY,
+    icon: 'fa-user-tie',
+    turnaround: '3–5 business days',
+    cta: 'Book a deep-dive',
+    includes: [
+      'Full PPM / offering-document read by an analyst',
+      'AI 21-flag report + human interpretation',
+      'Line-by-line risk & terms breakdown',
+      'Specific questions to ask the promoter',
+      '30-minute review call to walk through findings',
+      'Written recommendation & red-flag memo',
+    ],
+  },
+]
+

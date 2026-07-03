@@ -3,7 +3,7 @@ import { cors } from 'hono/cors'
 import { analyzeSubmission, FLAG_FRAMEWORK, type Bindings } from './analyzer'
 import { HomePage } from './page'
 import { PricingPage } from './pricing'
-import { PLANS, CURRENCY } from './plans'
+import { PLANS, ONE_TIME_OFFERINGS, CURRENCY } from './plans'
 
 const app = new Hono<{ Bindings: Bindings }>()
 
@@ -81,8 +81,10 @@ app.post('/api/analyze', async (c) => {
 // ── API: the framework (for the methodology page) ──
 app.get('/api/framework', (c) => c.json({ flags: FLAG_FRAMEWORK }))
 
-// ── API: membership plans (single source of truth for the pricing page) ──
-app.get('/api/plans', (c) => c.json({ currency: CURRENCY, plans: PLANS }))
+// ── API: membership plans + one-time offerings (single source of truth) ──
+app.get('/api/plans', (c) =>
+  c.json({ currency: CURRENCY, plans: PLANS, oneTimeOfferings: ONE_TIME_OFFERINGS })
+)
 
 // ── Home page ──
 app.get('/', (c) => c.html(HomePage()))

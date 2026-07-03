@@ -416,3 +416,17 @@ section{position:relative;z-index:1}
   .perk-grid{grid-template-columns:1fr}
   .pricing-hero{padding-top:100px}
 }
+
+/* one-time offerings */
+.onetime-band{padding-top:10px}
+.onetime-grid{grid-template-columns:repeat(3,1fr);max-width:1020px;margin:0 auto}
+.plan.onetime .pp-ico{background:var(--grad-2);box-shadow:0 12px 28px -12px rgba(62,201,122,.6)}
+.plan.onetime.featured{background:
+  linear-gradient(var(--card),var(--card)) padding-box,
+  var(--grad-2) border-box;box-shadow:0 30px 80px -28px rgba(62,201,122,.5)}
+.plan.onetime .pp-badge{background:var(--grad-2)}
+.plan.onetime .pp-quota i{color:var(--gold);margin-right:5px}
+.ot-from{font-size:14px;font-weight:700;color:var(--muted);align-self:center}
+.plan.onetime .pp-per{font-size:13px}
+@media(max-width:1000px){ .onetime-grid{grid-template-columns:repeat(2,1fr)} }
+@media(max-width:600px){ .onetime-grid{grid-template-columns:1fr} }

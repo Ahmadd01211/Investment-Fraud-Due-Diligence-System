@@ -1,7 +1,7 @@
 // Server-rendered Memberships / Pricing page (single-file HTML string).
 // Plan data comes from ./plans (the same data served at /api/plans), so the
 // page always matches the backend source of truth.
-import { PLANS, type Plan } from './plans'
+import { PLANS, ONE_TIME_OFFERINGS, type Plan, type OneTimeOffering } from './plans'
 
 function money(v: number | null): string {
   if (v === null) return 'Custom'
@@ -59,8 +59,40 @@ function planCard(p: Plan): string {
   </article>`
 }
 
+function offeringCard(o: OneTimeOffering): string {
+  const feat = o.featured ? ' featured' : ''
+  const badge = o.badge ? `<div class="pp-badge">${o.badge}</div>` : ''
+  const btnClass = o.featured ? 'btn btn-primary btn-block' : 'btn btn-ghost btn-block'
+  const price =
+    o.price === null
+      ? `<span class="pp-amount">Quoted</span>`
+      : `${o.priceFrom ? '<span class="ot-from">from</span> ' : ''}<span class="pp-amount">${money(
+          o.price
+        )}</span><span class="pp-per">one-time</span>`
+  const items = o.includes
+    .map((f) => `<li><i class="fas fa-check"></i><span>${f}</span></li>`)
+    .join('')
+  return `
+  <article class="plan onetime glass tilt-sm${feat}" id="offer-${o.id}" data-offer="${o.id}">
+    ${badge}
+    <div class="pp-head">
+      <div class="pp-ico"><i class="fas ${o.icon}"></i></div>
+      <h3 class="pp-name">${o.name}</h3>
+      <p class="pp-tag">${o.tagline}</p>
+    </div>
+    <div class="pp-price">${price}</div>
+    <div class="pp-quota"><i class="fas fa-clock"></i> Turnaround: ${o.turnaround}</div>
+    <a href="mailto:research@investsafepro.com?subject=${encodeURIComponent(o.name)}"
+       class="${btnClass} pp-cta" data-offer-cta="${o.id}">
+      <i class="fas fa-file-invoice"></i> ${o.cta}
+    </a>
+    <ul class="pp-features">${items}</ul>
+  </article>`
+}
+
 export function PricingPage(): string {
   const cards = PLANS.map(planCard).join('')
+  const offerCards = ONE_TIME_OFFERINGS.map(offeringCard).join('')
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -97,6 +129,7 @@ export function PricingPage(): string {
     <a href="/#how">How it works</a>
     <a href="/#methodology">Methodology</a>
     <a href="/pricing" class="active">Pricing</a>
+    <a href="/pricing#one-time">Research</a>
     <a class="nav-cta" href="/#analyze"><i class="fas fa-magnifying-glass-chart"></i> Check a pitch</a>
   </nav>
 </header>
@@ -130,6 +163,19 @@ export function PricingPage(): string {
       ${cards}
     </div>
     <p class="pricing-note"><i class="fas fa-lock"></i> No API keys, ever. We run the AI for you. Prices in USD. Taxes may apply.</p>
+  </section>
+
+  <!-- ───────────── ONE-TIME OFFERINGS ───────────── -->
+  <section id="one-time" class="band onetime-band">
+    <div class="band-head">
+      <span class="kicker">No subscription needed</span>
+      <h2>One-time research &amp; expert services</h2>
+      <p>Vetting a single deal? Buy a standalone report — like hands-on <strong>title &amp; property research</strong> or a human expert deep-dive. Pay once, no membership required.</p>
+    </div>
+    <div class="plans-grid onetime-grid" id="offeringsGrid">
+      ${offerCards}
+    </div>
+    <p class="pricing-note"><i class="fas fa-circle-info"></i> One-time services are performed by our research team. "From" prices vary with document size &amp; property count — you'll get a fixed quote before any work begins.</p>
   </section>
 
   <!-- ───────────── COMPARE ───────────── -->
