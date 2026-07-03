@@ -115,4 +115,73 @@ app.get('/api/premium', (c) =>
 // ── Premium Services page ──
 app.get('/premium', (c) => c.html(PremiumPage()))
 
+// ── Premium / Asset-Valuation service request intake ──
+// Receives the modal form submissions from /premium. Validates the minimal
+// required fields, generates a confidential reference id, and (best-effort)
+// persists to KV when the binding is available. No PII is logged.
+app.post('/api/premium-request', async (c) => {
+  let body: Record<string, any>
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ ok: false, error: 'Invalid request payload.' }, 400)
+  }
+
+  const kind = body.kind === 'valuation' ? 'valuation' : 'premium'
+  const name = String(body.name || '').trim()
+  const email = String(body.email || '').trim()
+  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+
+  if (!name || !emailOk) {
+    return c.json(
+      { ok: false, error: 'A valid name and email address are required.' },
+      400
+    )
+  }
+  if (kind === 'premium') {
+    if (!String(body.target || '').trim() || !String(body.clientType || '').trim()) {
+      return c.json(
+        { ok: false, error: 'Client type and subject of investigation are required.' },
+        400
+      )
+    }
+  } else {
+    if (!String(body.sponsor || '').trim()) {
+      return c.json({ ok: false, error: 'Sponsor / syndicator name is required.' }, 400)
+    }
+  }
+
+  const prefix = kind === 'valuation' ? 'AV' : 'PS'
+  const reference = `${prefix}-${Date.now().toString(36).toUpperCase()}-${Math.random()
+    .toString(36)
+    .slice(2, 6)
+    .toUpperCase()}`
+
+  const record = {
+    reference,
+    kind,
+    receivedAt: new Date().toISOString(),
+    ...body,
+  }
+
+  // Best-effort persistence — only if a KV namespace is bound.
+  try {
+    const kv = (c.env as any)?.KV
+    if (kv && typeof kv.put === 'function') {
+      await kv.put(`premium-request:${reference}`, JSON.stringify(record), {
+        expirationTtl: 60 * 60 * 24 * 90, // 90 days
+      })
+    }
+  } catch {
+    // Persistence is optional; the request is still accepted.
+  }
+
+  return c.json({
+    ok: true,
+    reference,
+    message:
+      'Request received. A member of our team will respond within one business day to confirm scope, pricing, and engagement letter.',
+  })
+})
+
 export default app
