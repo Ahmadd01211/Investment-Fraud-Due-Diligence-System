@@ -3,12 +3,13 @@
 //  Uses our managed OpenAI key. No BYOK. Built on the documented
 //  Barry Minkow investigative methodology (21-flag framework).
 //
-//  v2.0 — Chunk-and-Merge for unlimited document size + Kimi 2.6 support
+//  v2.0 — Chunk-and-Merge for unlimited document size + Kimi (kimi-k2.6) support
 //  ──
 //  Large documents are split into overlapping chunks, analyzed in parallel,
 //  then merged by taking the HIGHEST evidence tier per flag across all chunks.
 //  This makes scoring deterministic AND monotonic (more text never lowers score).
-//  Kimi 2.6 (2M context window) is used when available, skipping chunking entirely.
+//  Kimi (kimi-k2.6, ~256K-token context) is used when available for large docs,
+//  handling them in a single shot up to ~600K chars before falling back to chunking.
 // ════════════════════════════════════════════════════════════════
 
 export type Bindings = {
@@ -32,9 +33,9 @@ export type Bindings = {
   // ── Kimi 2.6 support ──
   /** Optional: Moonshot AI / Kimi API key. If set, large docs route here. */
   KIMI_API_KEY?: string
-  /** Optional: Kimi API base URL (default https://api.moonshot.cn/v1). */
+  /** Optional: Kimi API base URL (default https://api.moonshot.ai/v1). */
   KIMI_BASE_URL?: string
-  /** Optional: Kimi model name (default kimi-2.6). */
+  /** Optional: Kimi model name (default kimi-k2.6). */
   KIMI_MODEL?: string
   /** Optional: char threshold above which Kimi is used instead of chunking (default 150000). */
   KIMI_DOC_CHARS?: string
@@ -479,8 +480,8 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
   const apiKey = env.OPENAI_API_KEY
   const baseUrl = (env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '')
   const kimiApiKey = env.KIMI_API_KEY
-  const kimiBaseUrl = (env.KIMI_BASE_URL || 'https://api.moonshot.cn/v1').replace(/\/$/, '')
-  const kimiModel = env.KIMI_MODEL || 'kimi-2.6'
+  const kimiBaseUrl = (env.KIMI_BASE_URL || 'https://api.moonshot.ai/v1').replace(/\/$/, '')
+  const kimiModel = env.KIMI_MODEL || 'kimi-k2.6'
 
   if (!apiKey && !kimiApiKey) {
     throw new Error('Analysis service is not configured. (Missing server API key.)')
@@ -511,15 +512,18 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
   let results: any[]
 
   if (useKimi) {
-    // ── KIMI 2.6: SINGLE SHOT (2M context window = no chunking) ──
+    // ── KIMI (kimi-k2.6): SINGLE SHOT ──
+    // Real context window = 262,144 tokens (~256K), roughly ~800K chars of English.
+    // We cap the material well under that to leave room for the system prompt and
+    // the JSON output, so large docs still go in one shot without chunking.
     const config: ApiConfig = {
       apiKey: kimiApiKey,
       baseUrl: kimiBaseUrl,
       model: kimiModel,
     }
-    // Kimi can handle ~2M tokens (~8M chars), so we send the full doc
-    const material = rawMaterial.slice(0, 2000000) // hard cap at 2M chars for safety
-    const wasTruncated = rawMaterial.length > 2000000
+    const KIMI_MATERIAL_CAP = 600000 // ~180K tokens of material; leaves headroom
+    const material = rawMaterial.slice(0, KIMI_MATERIAL_CAP)
+    const wasTruncated = rawMaterial.length > KIMI_MATERIAL_CAP
 
     const textPart =
       (ctx.length ? `INVESTOR-PROVIDED CONTEXT:\n${ctx.join('\n')}\n\n` : '') +
