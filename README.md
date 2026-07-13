@@ -33,17 +33,28 @@ managed API key, so users never have to bring their own.
 - **Explainable score breakdown** — an expandable table showing Flag # | Name | Weight | Severity |
   Evidence Tier | Weighted Points, the exact calculation, and the key score drivers.
 
-### Document Size: Unlimited (Chunk-and-Merge v2.0)
-- **No size limits** — upload documents of any length. The backend handles large documents via:
-  - **Kimi 2.6** (2M token context window) — when configured with a `KIMI_API_KEY`, large documents
-    are sent directly to Kimi without chunking, producing a single coherent analysis.
-  - **Chunk-and-Merge** — documents exceeding the per-chunk threshold are split into overlapping
-    chunks (~100k chars each, with ~5k overlap), analyzed in parallel, and merged by taking the
-    **highest evidence tier** per flag across all chunks. This is **monotonically deterministic** —
-    more text can only increase or maintain the score, never lower it.
-- **Deterministic scoring** — the server re-computes the score authoritatively using the tier-based
-  severity table, so the same document always produces the same score regardless of how many
-  chunks it required.
+### Document Size: Unlimited (Browser-Driven Chunk Pipeline v3.0)
+- **No size limits** — upload documents of any length. Small documents are analyzed in one shot;
+  large documents are handled by a **browser-driven chunk pipeline** that keeps every HTTP request
+  short (so no single request ever hits the Cloudflare Worker duration limit — works on the free
+  plan, no Queues, no BYOK):
+  1. The browser asks the server to **split** the document authoritatively (`/api/split`).
+  2. It analyzes **one chunk per request** (`/api/analyze-chunk`), threading a carryover context
+     tail between chunks, with a live "part N of M" progress indicator.
+  3. It posts all chunk results to `/api/merge`, which produces the final scored report using the
+     **same merge + relevance-gate + scoring** as the one-shot path.
+- **Merge is monotonic & deterministic** — for each of the 21 flags the **highest evidence tier**
+  across all chunks wins, and the server re-computes the score authoritatively from the tier-based
+  severity table. More text can only increase or maintain the score, never lower it.
+- **Rate-limit resilient** — chunk requests retry on HTTP 429 with backoff that honors OpenAI's
+  "try again in Xs" hint, and pace between chunks, so large docs complete even on a low-TPM key.
+
+### TPM-driven chunk sizing (future-proof)
+- The per-chunk size is **derived from your OpenAI key's tokens-per-minute limit** via `OPENAI_TPM`
+  (uses ≤50% of TPM as input, ~4 chars/token). Raise your key's tier → set `OPENAI_TPM` higher →
+  chunks automatically get bigger and fewer, **no code change**. `MAX_CHUNK_CHARS` remains a manual
+  override; a hard 300k-char ceiling caps any single call.
+  - `OPENAI_TPM=30000` → ~60k-char chunks · `200000` → ~300k-char chunks (mid-size docs single-shot).
 
 ### Official Scoring Methodology (matches the original IIE engine)
 - Each triggered flag gets a **severity (1–10)** and an **Evidence Tier**:
@@ -76,16 +87,25 @@ managed API key, so users never have to bring their own.
 | Method | Path | Purpose | Params |
 |---|---|---|---|
 | `GET` | `/` | The full single-page app (hero, analyzer, samples, methodology, FAQ) | — |
-| `POST` | `/api/analyze` | Run a fraud analysis | JSON body: `material` (required, ≥30 chars), `sponsorName?`, `assetType?`, `claimedReturn?`, `amountAsked?`, `sourceType?` |
+| `POST` | `/api/analyze` | Run a **single-shot** fraud analysis (small docs / images) | JSON body: `material` (required, ≥30 chars), `sponsorName?`, `assetType?`, `claimedReturn?`, `amountAsked?`, `sourceType?`, `images?[]` |
+| `GET` | `/api/chunk-plan?len=<chars>` | Report whether a doc of that length needs chunking + the plan | query `len` |
+| `POST` | `/api/split` | Authoritative server-side split of a large doc into chunks | JSON body: `material` |
+| `POST` | `/api/analyze-chunk` | Analyze ONE chunk (used by the browser-driven pipeline) | JSON body: `chunk`, `chunkIndex`, `totalChunks`, `carryover?`, `images?[]`, + optional detail fields |
+| `POST` | `/api/merge` | Merge per-chunk results into the final scored report | JSON body: `results[]` |
 | `GET` | `/api/framework` | Returns the 21-flag framework (used by the methodology grid) | — |
+
+**Routing:** the frontend calls `/api/chunk-plan`; if a doc fits one call (or has images) it uses
+`/api/analyze` (unchanged). Larger text docs use `/api/split` → `/api/analyze-chunk` (looped) →
+`/api/merge`.
 
 **`/api/analyze` response shape:** `{ ok: true, result: { riskScore, riskLevel, verdict, summary, triggeredFlags[], extractedClaims[], contradictions[], verifyNext[], investorAdvice, disclaimer } }`
 
 ## Data Architecture
 - **No database.** The app is stateless by design — each request is analyzed and returned; nothing
   is persisted. (Privacy is a feature for the target audience.)
-- **AI engine**: server-side call to an OpenAI-compatible chat-completions endpoint
-  (`gpt-5-mini`) with the 21-flag methodology baked into the system prompt and strict JSON output.
+- **AI engine (GPT-only)**: server-side calls to an OpenAI-compatible chat-completions endpoint,
+  with the 21-flag methodology baked into the system prompt and strict JSON output. **Different GPT
+  models are chosen by document type** (see below).
 - **Secrets**: `OPENAI_API_KEY` + `OPENAI_BASE_URL` — provided to the Worker as environment
   variables / secrets (see Deployment). Never exposed to the browser.
 
@@ -117,86 +137,81 @@ managed API key, so users never have to bring their own.
 ## Local Development
 ```bash
 npm run build                       # build to dist/
-pm run dev:sandbox                  # serve via wrangler pages dev on :3000
+npm run dev:sandbox                 # serve via wrangler pages dev on :3000
 # or
 pm2 start ecosystem.config.cjs       # serve via PM2 (recommended)
 curl http://localhost:3000          # smoke test
 ```
 
-### Backend AI configuration (NO BYOK — you provide ONE key for all users)
+### Backend AI configuration (GPT-only, NO BYOK — you provide ONE key for all users)
 
-The app supports **two AI providers**: OpenAI-compatible (default) and **Kimi 2.6** (for large documents).
-
-#### OpenAI-compatible provider
-The app calls any **OpenAI-compatible** Chat Completions API. Configure it once on the
-backend; end users never enter a key.
+The app calls any **OpenAI-compatible** Chat Completions API with a single `OPENAI_API_KEY`.
+End users never enter a key. **A different GPT model is used per document type:**
 
 | Var | Purpose | Default |
 |-----|---------|---------|
 | `OPENAI_API_KEY` | your provider secret | (required) |
 | `OPENAI_BASE_URL` | API base | `https://api.openai.com/v1` |
-| `OPENAI_TEXT_MODEL` | model for text-only submissions (cheap) | `gpt-5.4-mini` |
-| `OPENAI_VISION_MODEL` | model for submissions **with images** (sharp vision) | `gpt-5.4` |
-| `OPENAI_MODEL` | optional — force ONE model for everything (overrides the split) | _(unset)_ |
-| `OPENAI_MAX_MATERIAL_CHARS` | max chars per chunk (default 100k) | `100000` |
-| `OPENAI_REASONING_EFFORT` | `none`/`low`/`medium`/`high` — default `low` for consistency | `low` |
+| `OPENAI_SHORT_MODEL` | short text submissions (≤ `OPENAI_SHORT_DOC_CHARS`) — fast/cheap | `gpt-4.1-mini` |
+| `OPENAI_TEXT_MODEL` | normal text submissions | `gpt-4.1` |
+| `OPENAI_VISION_MODEL` | submissions **with images** (sharp vision) | `gpt-5.4` |
+| `OPENAI_LARGE_MODEL` | large/chunked text documents | `gpt-4.1` |
+| `OPENAI_SHORT_DOC_CHARS` | char threshold below which the SHORT model is used | `6000` |
+| `OPENAI_MODEL` | optional — force ONE model for everything (overrides the per-type split) | _(unset)_ |
+| `OPENAI_TPM` | your key's tokens-per-minute limit — **drives chunk size** (future-proof) | `30000` |
+| `MAX_CHUNK_CHARS` | optional manual override of the TPM-derived per-chunk cap | _(unset)_ |
+| `MIN_CHUNK_CHARS` | min chars per chunk so tiny docs aren't over-split | `20000` |
+| `CHUNK_PERCENT` | target chunk size as a % of the document | `25` |
+| `CARRYOVER_PERCENT` | carryover context between chunks, as a % of chunk size | `10` |
+| `OPENAI_REASONING_EFFORT` | `none`/`low`/`medium`/`high` (for GPT-5/o models) — `low` for consistency | `low` |
 
-**Smart model routing:** when the user attaches an image/screenshot the app uses
-`OPENAI_VISION_MODEL` (default `gpt-5.4`, sharper vision); plain-text submissions use
-the cheaper `OPENAI_TEXT_MODEL` (`gpt-5.4-mini`). Set `OPENAI_MODEL` to force one model.
-The code auto-selects `max_completion_tokens` for GPT-5/o-series models and
-`max_tokens` for older models (gpt-4o).
-
-#### Kimi 2.6 provider (optional, for large documents)
-Kimi 2.6 has a **2M token context window** (~8M characters), so large documents can be
-sent in a single shot without chunking. When configured, documents exceeding the threshold
-auto-route to Kimi for a single coherent analysis.
-
-| Var | Purpose | Default |
-|-----|---------|---------|
-| `KIMI_API_KEY` | Moonshot AI / Kimi API key | _(unset — Kimi disabled)_ |
-| `KIMI_BASE_URL` | Kimi API base | `https://api.moonshot.cn/v1` |
-| `KIMI_MODEL` | Kimi model name | `kimi-2.6` |
-| `KIMI_DOC_CHARS` | char threshold to route to Kimi | `150000` |
-
-**Routing priority:** If `KIMI_API_KEY` is set and the document exceeds `KIMI_DOC_CHARS`,
-the document goes to Kimi 2.6 in a single call. Otherwise, standard chunking or single-shot
-with the OpenAI-compatible provider is used.
+**Per-type model routing** (`pickModel`): images → `OPENAI_VISION_MODEL`; text ≤ `OPENAI_SHORT_DOC_CHARS`
+→ `OPENAI_SHORT_MODEL`; large/chunked text → `OPENAI_LARGE_MODEL`; otherwise `OPENAI_TEXT_MODEL`.
+`OPENAI_MODEL` forces one model for everything. The code auto-selects `max_completion_tokens` for
+GPT-5/o-series models and `max_tokens` otherwise.
 
 For local dev, put them in `.dev.vars` (git-ignored):
 ```
-# OpenAI-compatible (required)
 OPENAI_API_KEY=sk-your-openai-key
 OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_TEXT_MODEL=gpt-5.4-mini
+OPENAI_SHORT_MODEL=gpt-4.1-mini
+OPENAI_TEXT_MODEL=gpt-4.1
 OPENAI_VISION_MODEL=gpt-5.4
+OPENAI_LARGE_MODEL=gpt-4.1
+OPENAI_SHORT_DOC_CHARS=6000
+OPENAI_REASONING_EFFORT=low
 
-# Kimi 2.6 (optional — enables large-doc single-shot)
-KIMI_API_KEY=sk-your-kimi-key
-KIMI_BASE_URL=https://api.moonshot.cn/v1
-KIMI_MODEL=kimi-2.6
-KIMI_DOC_CHARS=150000
+# TPM-driven chunk sizing — set to your key's real TPM to future-proof
+OPENAI_TPM=30000
+CHUNK_PERCENT=25
+CARRYOVER_PERCENT=10
+MIN_CHUNK_CHARS=20000
+# MAX_CHUNK_CHARS=60000   # optional manual override
 ```
 
-Works with OpenAI, OpenRouter, Together, Groq, Azure OpenAI, Kimi, etc. — just set the
-matching `OPENAI_BASE_URL` and `OPENAI_MODEL` (or `KIMI_BASE_URL` for Kimi).
+Works with OpenAI, OpenRouter, Together, Groq, Azure OpenAI, etc. — just set the matching
+`OPENAI_BASE_URL` and model names.
 
-## How Chunk-and-Merge Works (for large documents)
+## How the Browser-Driven Chunk Pipeline Works (large documents)
 
-When a document exceeds the per-chunk threshold (~100k chars by default):
+When a document is too large to fit one call (per `/api/chunk-plan`):
 
-1. **Split** — The document is split into overlapping chunks (~100k chars each, with ~5k overlap
-   to preserve context at boundaries). The split tries to break at sentence boundaries to keep
-   context intact.
+1. **Split** (`/api/split`) — The **server** splits the document authoritatively into chunks (size
+   derived from `OPENAI_TPM`), breaking at sentence boundaries where possible. Doing the split
+   server-side guarantees the browser orchestrates the exact same chunks the engine expects.
 
-2. **Analyze in parallel** — Each chunk is sent to the AI model independently with the same
-   21-flag system prompt. Chunks are processed in parallel for speed.
+2. **Analyze one chunk per request** (`/api/analyze-chunk`) — The browser loops the chunks
+   **sequentially**, threading a carryover context tail from the previous chunk(s) so evidence that
+   spans a boundary is understood. Each request is short (one GPT call), so none hits the Worker
+   duration limit. 429 rate-limits are retried with backoff (honoring OpenAI's retry hint); a small
+   pause paces requests under the TPM window. A live "part N of M" indicator shows progress.
 
-3. **Merge** — For each of the 21 flags, the **highest evidence tier** found across all chunks
-   is kept. This is **monotonic**: more text can only increase or maintain the score, never lower it.
+3. **Merge** (`/api/merge`) — For each of the 21 flags, the **highest evidence tier** found across
+   all chunks is kept (monotonic: more text never lowers the score). The relevance gate uses a
+   majority vote across chunks.
 
 4. **Re-compute score** — The server re-computes the risk score authoritatively using the
-   `TIER_SEVERITY` table (server-side, deterministic), so the final score is always consistent.
+   `TIER_SEVERITY` table (deterministic), so a chunked analysis scores identically to a one-shot one.
 
 **Why this keeps scores stable:**
 - Severity is fixed by tier (not chosen by the model) — server-side `TIER_SEVERITY` table.
@@ -211,15 +226,18 @@ The backend keys are **secrets** in production (do not commit them):
 # one-time
 npx wrangler pages project create investsafe-pro --production-branch main
 
-# OpenAI-compatible secrets
+# required secrets
 npx wrangler pages secret put OPENAI_API_KEY --project-name investsafe-pro
 npx wrangler pages secret put OPENAI_BASE_URL --project-name investsafe-pro
+
+# recommended: set your key's TPM so large-doc chunking is sized correctly
+npx wrangler pages secret put OPENAI_TPM --project-name investsafe-pro
+
+# optional model overrides (defaults: gpt-4.1-mini / gpt-4.1 / gpt-5.4 / gpt-4.1)
+npx wrangler pages secret put OPENAI_SHORT_MODEL --project-name investsafe-pro
 npx wrangler pages secret put OPENAI_TEXT_MODEL --project-name investsafe-pro
 npx wrangler pages secret put OPENAI_VISION_MODEL --project-name investsafe-pro
-
-# Optional Kimi 2.6 secrets
-npx wrangler pages secret put KIMI_API_KEY --project-name investsafe-pro
-npx wrangler pages secret put KIMI_BASE_URL --project-name investsafe-pro
+npx wrangler pages secret put OPENAI_LARGE_MODEL --project-name investsafe-pro
 
 # deploy
 npm run deploy
@@ -229,7 +247,11 @@ npm run deploy
 - **Platform**: Cloudflare Pages
 - **Status**: ✅ Running locally in sandbox (PM2) · ⏳ Not yet deployed to production
 - **Project name**: `investsafe-pro`
-- **Last Updated**: 2026-07-13 — v2.0: Chunk-and-Merge for unlimited document size, Kimi 2.6 support (2M context window), monotonic deterministic merge, removed frontend 150k char cap. Score stability preserved via server-side TIER_SEVERITY table.
+- **Last Updated**: 2026-07-13 — v3.0: **GPT-only** per-document-type model routing (short/normal/
+  vision/large); **browser-driven chunk pipeline** (split → analyze-chunk → merge) so large docs
+  never hit the Worker request limit — no Queues / no BYOK / free-plan compatible; **TPM-driven chunk
+  sizing** (`OPENAI_TPM`) that scales automatically when you raise your key's tier; 429 rate-limit
+  retries with backoff. Removed Kimi/multi-provider. Deterministic scoring preserved.
 
 ## Not Yet Implemented / Next Steps
 - Live SEC EDGAR / FINRA BrokerCheck lookups (currently the report tells users *where* to verify).
