@@ -45,11 +45,18 @@ export type Bindings = {
   OPENAI_REASONING_EFFORT?: string
 
   // ── Generalized, percentage-based chunking (all optional) ──
+  /**
+   * Your OpenAI key's tokens-per-minute (TPM) limit. The per-chunk size is
+   * DERIVED from this automatically (≤50% of TPM as input), so raising your
+   * key's tier just means setting a bigger number here — no code change.
+   * Default 30000 (free/low tier). Set to your real TPM to future-proof.
+   */
+  OPENAI_TPM?: string
   /** Target chunk size as a PERCENT of the document (default 25 → ~4 chunks). */
   CHUNK_PERCENT?: string
   /** Carryover context as a PERCENT of chunk size (default 10). */
   CARRYOVER_PERCENT?: string
-  /** Hard max chars per chunk, model-safety cap (default 100000). */
+  /** Hard max chars per chunk — MANUAL OVERRIDE of the TPM-derived cap. */
   MAX_CHUNK_CHARS?: string
   /** Min chars per chunk, so tiny docs aren't over-split (default 20000). */
   MIN_CHUNK_CHARS?: string
@@ -199,26 +206,55 @@ export interface AnalyzeInput {
 
 // ── Percentage-based chunking defaults (generalized to any doc size) ──
 const DEFAULT_CHUNK_PERCENT = 25   // aim for ~4 chunks (25% each) by default
-const DEFAULT_CARRYOVER_PERCENT = 10 // carryover = 10% of chunk size
-const DEFAULT_MAX_CHUNK_CHARS = 100000 // model-safety cap per chunk
 const DEFAULT_MIN_CHUNK_CHARS = 20000  // don't over-split small docs
+const DEFAULT_CARRYOVER_PERCENT = 10 // carryover = 10% of chunk size
 const CHUNK_OVERLAP = 500          // tiny raw overlap; real continuity comes from carryover
-const MAX_CHUNKS = 40              // safety ceiling on number of chunks
+const MAX_CHUNKS = 60              // safety ceiling on number of chunks
+
+// ── TPM-driven sizing (future-proof) ──────────────────────────────
+// The single biggest constraint on chunk size is the OpenAI key's
+// tokens-per-minute (TPM) limit: ONE chunk request must fit inside it,
+// with headroom for the system prompt + the model's response.
+//   • Set OPENAI_TPM to your key's TPM (e.g. 30000, 200000, 2000000).
+//   • Chunk size is derived from it automatically — raise TPM and chunks
+//     get bigger / fewer with NO code change.
+//   • MAX_CHUNK_CHARS, if set, is a hard manual override that still wins.
+const DEFAULT_OPENAI_TPM = 30000        // conservative default (free/low tier)
+const CHARS_PER_TOKEN = 4               // rough English heuristic
+const TPM_INPUT_FRACTION = 0.5          // use ≤50% of TPM for the input chunk
+                                        // (leaves room for prompt + response + retry)
+const HARD_MAX_CHUNK_CHARS = 300000     // absolute ceiling regardless of TPM
+                                        // (~75k tokens; keeps one call sane)
+const DEFAULT_MIN_TPM_CHUNK = 8000      // never derive a chunk smaller than this
+
+/** Derive the max chunk size (chars) a single request may use, from TPM. */
+function tpmMaxChunkChars(env: Bindings): number {
+  // Explicit char override wins (manual control / legacy).
+  const explicit = Number(env.MAX_CHUNK_CHARS) || Number(env.OPENAI_MAX_MATERIAL_CHARS)
+  if (explicit > 0) return clamp(explicit, DEFAULT_MIN_TPM_CHUNK, HARD_MAX_CHUNK_CHARS)
+
+  const tpm = Number(env.OPENAI_TPM) || DEFAULT_OPENAI_TPM
+  const inputTokens = tpm * TPM_INPUT_FRACTION
+  const chars = Math.floor(inputTokens * CHARS_PER_TOKEN)
+  return clamp(chars, DEFAULT_MIN_TPM_CHUNK, HARD_MAX_CHUNK_CHARS)
+}
 
 /**
  * Decide the effective chunk size (chars) and carryover (chars) for a document,
  * expressed as PERCENTAGES of the doc / chunk, then clamped to safe bounds.
- * This generalizes: a 40K doc stays one chunk; a 2M doc splits into many.
+ * This generalizes: a small doc stays one chunk; a huge doc splits into many.
+ * The per-chunk ceiling is TPM-derived (see tpmMaxChunkChars) so it scales with
+ * your OpenAI key automatically.
  */
 function computeChunkPlan(env: Bindings, docLen: number) {
   const chunkPct = clamp(Number(env.CHUNK_PERCENT) || DEFAULT_CHUNK_PERCENT, 5, 100)
   const carryPct = clamp(Number(env.CARRYOVER_PERCENT) || DEFAULT_CARRYOVER_PERCENT, 0, 50)
-  const maxChunk = Number(env.MAX_CHUNK_CHARS) || Number(env.OPENAI_MAX_MATERIAL_CHARS) || DEFAULT_MAX_CHUNK_CHARS
-  const minChunk = Number(env.MIN_CHUNK_CHARS) || DEFAULT_MIN_CHUNK_CHARS
+  const maxChunk = tpmMaxChunkChars(env)
+  const minChunk = Math.min(Number(env.MIN_CHUNK_CHARS) || DEFAULT_MIN_CHUNK_CHARS, maxChunk)
 
   // Target size = chunkPct% of the document, clamped between [minChunk, maxChunk].
   let chunkSize = Math.round((docLen * chunkPct) / 100)
-  chunkSize = clamp(chunkSize, Math.min(minChunk, maxChunk), maxChunk)
+  chunkSize = clamp(chunkSize, minChunk, maxChunk)
 
   // Carryover = carryPct% of the chunk size, but never larger than a fixed
   // legacy override if the operator set one.
@@ -348,8 +384,20 @@ async function callLlmApi(config: ApiConfig, systemPrompt: string, userContent: 
 
 function handleApiError(resp: Response, txt: string): never {
   const low = txt.toLowerCase()
-  if (resp.status === 429 || low.includes('insufficient_quota') || low.includes('exceeded your current quota') || low.includes('billing') || low.includes('insufficient balance')) {
+  // Log the raw upstream error so operators can see WHY (rate limit vs. quota).
+  console.error(`[LLM upstream error] status=${resp.status} body=${txt.slice(0, 400)}`)
+
+  // Out of credits / billing cap → NOT retryable (retrying won't help).
+  if (low.includes('insufficient_quota') || low.includes('exceeded your current quota') || low.includes('billing') || low.includes('insufficient balance')) {
     throw new Error('SERVICE_QUOTA: The analysis service is temporarily unavailable (API quota/billing limit reached).')
+  }
+  // Rate limit (TPM/RPM) → RETRYABLE. Distinct prefix so the client backs off.
+  // Extract the "try again in 19.81s" hint (or Retry-After header) if present.
+  if (resp.status === 429) {
+    let retryAfter = Number(resp.headers.get('retry-after')) || 0
+    const m = txt.match(/try again in ([\d.]+)\s*s/i)
+    if (m) retryAfter = Math.ceil(parseFloat(m[1]))
+    throw new Error(`SERVICE_RATELIMIT:${retryAfter || ''}`)
   }
   if (resp.status === 401 || resp.status === 403) {
     throw new Error('SERVICE_AUTH: The analysis service is misconfigured (invalid API key).')
@@ -583,6 +631,158 @@ function mergeChunkResults(results: any[]): any {
 }
 
 // ════════════════════════════════════════════════════════════════
+//  SHARED HELPERS (used by both the one-shot and streaming paths)
+// ════════════════════════════════════════════════════════════════
+
+/** Build the investor-provided context lines from the structured fields. */
+function buildCtx(input: {
+  sponsorName?: string
+  assetType?: string
+  claimedReturn?: string
+  amountAsked?: string
+  sourceType?: string
+}): string[] {
+  const ctx: string[] = []
+  if (input.sponsorName) ctx.push(`Sponsor / promoter name: ${input.sponsorName}`)
+  if (input.assetType) ctx.push(`Asset type / strategy: ${input.assetType}`)
+  if (input.claimedReturn) ctx.push(`Claimed return / IRR: ${input.claimedReturn}`)
+  if (input.amountAsked) ctx.push(`Minimum investment / amount asked: ${input.amountAsked}`)
+  if (input.sourceType) ctx.push(`Where this came from: ${input.sourceType}`)
+  return ctx
+}
+
+// ════════════════════════════════════════════════════════════════
+//  BROWSER-DRIVEN CHUNK PIPELINE  (no Queues — each request is short)
+//
+//  For very large documents the browser splits the text, calls
+//  analyzeChunkRequest once PER CHUNK (each returns fast, well under the
+//  Worker request limit), then posts all chunk results to the merge
+//  endpoint which runs the SAME merge + gate + scoring as the one-shot
+//  path — so a chunked analysis scores identically to a single request.
+// ════════════════════════════════════════════════════════════════
+
+export interface ChunkPlanInfo {
+  /** Whether a document of this length needs the multi-chunk path at all. */
+  needsChunking: boolean
+  /** Effective chunk size (chars). */
+  chunkSize: number
+  /** Carryover context size (chars) threaded between chunks. */
+  carryover: number
+  /** Raw overlap applied at split boundaries. */
+  overlap: number
+  /** Total number of chunks the browser should produce. */
+  totalChunks: number
+}
+
+/**
+ * Report the chunking plan for a document of `docLen` chars so the CLIENT can
+ * split the text exactly the way the server would. `needsChunking` is false
+ * when the whole doc fits one call (browser should use /api/analyze instead).
+ */
+export function getChunkPlan(env: Bindings, docLen: number): ChunkPlanInfo {
+  const plan = computeChunkPlan(env, docLen)
+  const needsChunking = docLen > plan.maxChunk
+  const totalChunks = needsChunking
+    ? Math.min(splitIntoChunks('x'.repeat(docLen), plan.chunkSize, CHUNK_OVERLAP).length, MAX_CHUNKS)
+    : 1
+  return {
+    needsChunking,
+    chunkSize: plan.chunkSize,
+    carryover: plan.carryover,
+    overlap: CHUNK_OVERLAP,
+    totalChunks,
+  }
+}
+
+/**
+ * Authoritatively split a document into chunks server-side, so the browser
+ * orchestrates the exact same chunks the one-shot path would produce (no risk
+ * of the client's split drifting from the server algorithm). Also returns the
+ * carryover size so the browser can thread cross-boundary context.
+ */
+export function splitDocument(env: Bindings, text: string): { chunks: string[]; carryover: number } {
+  const plan = computeChunkPlan(env, text.length)
+  const chunks = splitIntoChunks(text, plan.chunkSize, CHUNK_OVERLAP)
+  return { chunks, carryover: plan.carryover }
+}
+
+export interface ChunkRequestInput {
+  chunk: string
+  chunkIndex: number
+  totalChunks: number
+  carryover?: string
+  sponsorName?: string
+  assetType?: string
+  claimedReturn?: string
+  amountAsked?: string
+  sourceType?: string
+  /** Only the FIRST chunk should carry images (single vision call). */
+  images?: string[]
+}
+
+/**
+ * Analyze ONE chunk of a large document. Uses the GPT-only per-type routing:
+ * the image-bearing first chunk → vision model, all text chunks → large model.
+ * Returns the raw per-chunk JSON (NOT normalized) — the client collects these
+ * and posts them to mergeChunkAnalysis for the final scored report.
+ */
+export async function analyzeChunkRequest(env: Bindings, input: ChunkRequestInput): Promise<any> {
+  if (!env.OPENAI_API_KEY) {
+    throw new Error('Analysis service is not configured. (Set OPENAI_API_KEY.)')
+  }
+  const ctx = buildCtx(input)
+  const images = (input.images || [])
+    .filter((s) => typeof s === 'string' && s.startsWith('data:image'))
+    .slice(0, 4)
+  const hasImages = images.length > 0
+
+  // Total doc is large (we're on the chunk path), so isChunk = true.
+  const model = pickModel(env, { hasImages, docLen: Number.MAX_SAFE_INTEGER, isChunk: true })
+  const config = makeConfig(env, model)
+
+  return analyzeOneChunk(
+    config,
+    ctx,
+    String(input.chunk || ''),
+    hasImages ? images : [],
+    Number(input.chunkIndex) || 0,
+    Number(input.totalChunks) || 1,
+    String(input.carryover || '')
+  )
+}
+
+/**
+ * Merge an array of per-chunk results into the final scored report, running the
+ * EXACT same merge → relevance gate → normalize pipeline as analyzeSubmission.
+ * This is the single source of truth for scoring on the chunked path.
+ */
+export function mergeChunkAnalysis(results: any[]): any {
+  const clean = (Array.isArray(results) ? results : []).filter((r) => r && typeof r === 'object')
+  if (clean.length === 0) {
+    throw new Error('SERVICE_MESSAGE:No analysis results were provided to merge.')
+  }
+
+  const merged = mergeChunkResults(clean)
+
+  // Relevance gate (identical to analyzeSubmission): only reject if a MAJORITY
+  // of chunks say "not investment related".
+  if (merged && merged.isInvestmentRelated === false) {
+    const relevantCount = clean.filter((r) => r?.isInvestmentRelated === true).length
+    if (relevantCount > clean.length / 2) {
+      merged.isInvestmentRelated = true
+    } else {
+      const reason =
+        String(merged.notRelevantReason || '').trim() ||
+        clean.find((r) => r?.notRelevantReason)?.notRelevantReason ||
+        'This does not appear to be an investment offering, pitch, or solicitation.'
+      throw new Error('NOT_RELEVANT:' + reason)
+    }
+  }
+
+  return normalizeResult(merged)
+}
+
+// ════════════════════════════════════════════════════════════════
 //  MAIN ENTRY POINT
 // ════════════════════════════════════════════════════════════════
 
@@ -592,12 +792,7 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
     throw new Error('Analysis service is not configured. (Set OPENAI_API_KEY.)')
   }
 
-  const ctx: string[] = []
-  if (input.sponsorName) ctx.push(`Sponsor / promoter name: ${input.sponsorName}`)
-  if (input.assetType) ctx.push(`Asset type / strategy: ${input.assetType}`)
-  if (input.claimedReturn) ctx.push(`Claimed return / IRR: ${input.claimedReturn}`)
-  if (input.amountAsked) ctx.push(`Minimum investment / amount asked: ${input.amountAsked}`)
-  if (input.sourceType) ctx.push(`Where this came from: ${input.sourceType}`)
+  const ctx = buildCtx(input)
 
   const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 4)
   const hasImages = images.length > 0

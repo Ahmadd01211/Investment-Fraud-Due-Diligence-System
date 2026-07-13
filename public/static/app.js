@@ -286,29 +286,140 @@
     showState('loading'); cycleMsgs();
     document.getElementById('analyze').scrollIntoView({ behavior: 'smooth', block: 'start' });
 
-    const payload = {
-      material: text,
+    const meta = {
       sponsorName: $('#sponsorName').value.trim(),
       assetType: $('#assetType').value.trim(),
       claimedReturn: $('#claimedReturn').value.trim(),
       amountAsked: $('#amountAsked').value.trim(),
       sourceType: $('#sourceType').value.trim(),
-      images: attachedImages.map((a) => a.dataUrl),
     };
-    try {
-      const res = await fetch('/api/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        // Special case: the submission isn't an investment at all.
-        if (data && data.error === 'invalid_submission') {
-          showState('empty');
-          showNotice(data.title || "This doesn't look like an investment", data.message || 'Please submit an investment offering, pitch, ad, email, or document.');
-          toast('Not an investment — nothing to analyze', 'err');
-          return;
-        }
+    const images = attachedImages.map((a) => a.dataUrl);
+
+    // Handle the "not an investment" and generic error shapes the same way for
+    // both the one-shot and chunked paths.
+    const handleErr = (data, res) => {
+      if (data && data.error === 'invalid_submission') {
+        showState('empty');
+        showNotice(data.title || "This doesn't look like an investment", data.message || 'Please submit an investment offering, pitch, ad, email, or document.');
+        toast('Not an investment — nothing to analyze', 'err');
+        return true; // handled
+      }
+      if (!res.ok || (data && data.error)) {
         throw new Error((data && (data.message || data.error)) || 'Analysis failed.');
       }
-      renderResult(data.result);
+      return false;
+    };
+
+    try {
+      // Ask the server whether this document needs the multi-chunk pipeline.
+      // Images always go single-shot (one vision call).
+      let plan = { needsChunking: false, totalChunks: 1 };
+      if (images.length === 0 && text.length > 0) {
+        try {
+          const pr = await fetch('/api/chunk-plan?len=' + text.length);
+          if (pr.ok) plan = await pr.json();
+        } catch { /* fall back to single-shot */ }
+      }
+
+      let result;
+      if (!plan.needsChunking) {
+        // ── SINGLE SHOT (small doc or images) ── unchanged behaviour ──
+        const res = await fetch('/api/analyze', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ material: text, images, ...meta }),
+        });
+        const data = await res.json();
+        if (handleErr(data, res)) return;
+        result = data.result;
+      } else {
+        // ── LARGE DOC: browser-driven chunk pipeline ──
+        // 1) server splits authoritatively → 2) analyze each chunk (short
+        //    requests) → 3) merge server-side. Live progress in loadingMsg.
+        clearInterval(msgTimer); // stop the generic cycling messages
+        const sres = await fetch('/api/split', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ material: text }),
+        });
+        const sdata = await sres.json();
+        if (!sres.ok || sdata.error) throw new Error(sdata.error || 'Could not prepare the document.');
+        const chunks = sdata.chunks || [];
+        const carryChars = Number(sdata.carryover) || 0;
+        const total = chunks.length;
+
+        const results = [];
+        let carryover = '';
+        let acc = '';
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        for (let i = 0; i < total; i++) {
+          const pct = Math.round((i / total) * 100);
+          loadingMsg.textContent = `Analyzing large document — part ${i + 1} of ${total}… (${pct}%)`;
+
+          // Each chunk is a short request. Retry transient rate-limit / busy
+          // responses (429/503) with exponential backoff so a big document
+          // doesn't fail just because chunks were sent close together.
+          const MAX_RETRIES = 4;
+          let data = null, res = null, done = false;
+          for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            res = await fetch('/api/analyze-chunk', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chunk: chunks[i],
+                chunkIndex: i,
+                totalChunks: total,
+                carryover,
+                images: i === 0 ? images : [], // only first chunk carries images
+                ...meta,
+              }),
+            });
+            data = await res.json();
+            if (res.status === 429 || res.status === 503) {
+              if (attempt < MAX_RETRIES) {
+                // Honor the server's retry-after hint (from OpenAI's TPM
+                // window) when present; otherwise exponential backoff.
+                const hint = Number(data && data.retryAfter) || 0;
+                const backoff = Math.round(2000 * Math.pow(2, attempt)); // 2s,4s,8s,16s
+                const wait = Math.max(hint * 1000 + 500, backoff);
+                loadingMsg.textContent =
+                  `Analyzing large document — part ${i + 1} of ${total}… (service busy, retrying in ${Math.round(wait / 1000)}s)`;
+                await sleep(wait);
+                continue;
+              }
+            }
+            done = true;
+            break;
+          }
+
+          // A single chunk being "not an investment" shouldn't abort the whole
+          // doc — the merge step applies the majority relevance gate.
+          if (!res.ok && data && data.error !== 'invalid_submission') {
+            throw new Error((data && (data.message || data.error)) || `Analysis failed on part ${i + 1}.`);
+          }
+          if (data && data.result) results.push(data.result);
+
+          // Gentle pacing between chunks to stay under provider rate limits.
+          if (i < total - 1) await sleep(600);
+
+          // Carryover for the NEXT chunk = last `carryChars` chars seen so far
+          // (mirrors the server's carryover threading exactly).
+          acc = (acc + '\n' + chunks[i]);
+          carryover = carryChars > 0 ? acc.slice(-carryChars) : '';
+        }
+
+        if (results.length === 0) {
+          throw new Error('The analysis service was busy and no parts could be analyzed. Please try again in a minute.');
+        }
+
+        loadingMsg.textContent = 'Combining findings into your final report…';
+        const mres = await fetch('/api/merge', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ results }),
+        });
+        const mdata = await mres.json();
+        if (handleErr(mdata, mres)) return;
+        result = mdata.result;
+      }
+
+      renderResult(result);
       showState('content');
       toast('Report ready', 'ok');
     } catch (err) {
