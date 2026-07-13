@@ -17,43 +17,32 @@
 //    • Results merge by taking the HIGHEST evidence tier per flag across chunks —
 //      deterministic AND monotonic (more text never lowers the score).
 //
-//  PROVIDERS & FALLBACK:
-//    • OpenAI (gpt-4.1 text / gpt-5.4 vision) and Kimi (kimi-k2.6, ~250K ctx).
-//    • A provider is "available" only if its API key is set. If the preferred
-//      provider is missing OR fails at runtime (quota/auth/5xx), we automatically
-//      fall back to the other one.
+//  MODEL SELECTION — GPT only, by DOCUMENT TYPE:
+//    • images (screenshot / deck page / ad photo) → VISION model  (gpt-5.4)
+//    • short text (small pitch / email / ad)       → SHORT model  (gpt-4.1-mini)
+//    • normal text (typical offering doc)          → TEXT model   (gpt-4.1)
+//    • large text (long doc → chunked)             → LARGE model  (gpt-4.1)
+//    All four are env-overridable; set OPENAI_MODEL to force one for everything.
 // ════════════════════════════════════════════════════════════════
 
 export type Bindings = {
-  // ── OpenAI provider ──
+  // ── OpenAI (only provider) ──
   OPENAI_API_KEY?: string
   OPENAI_BASE_URL?: string
-  /** Optional: force ONE model for everything (overrides text/vision split). */
+  /** Optional: force ONE model for everything (overrides the per-type split). */
   OPENAI_MODEL?: string
-  /** Optional: model for text-only submissions (default gpt-4.1). */
+  /** Optional: model for SHORT text submissions (default gpt-4.1-mini, fast/cheap). */
+  OPENAI_SHORT_MODEL?: string
+  /** Optional: model for NORMAL text submissions (default gpt-4.1). */
   OPENAI_TEXT_MODEL?: string
   /** Optional: model for submissions WITH images (default gpt-5.4, sharp vision). */
   OPENAI_VISION_MODEL?: string
+  /** Optional: model for LARGE/chunked text documents (default gpt-4.1). */
+  OPENAI_LARGE_MODEL?: string
+  /** Optional: char threshold: at/below this a doc uses the SHORT model (default 6000). */
+  OPENAI_SHORT_DOC_CHARS?: string
   /** Optional: reasoning effort for GPT-5/o models (none|low|medium|high). Default low for consistency. */
   OPENAI_REASONING_EFFORT?: string
-  /** Optional: high-capability model for large/complex documents (default = text model). */
-  OPENAI_LARGE_MODEL?: string
-  /** Optional: char threshold above which the large model is used (default = never). */
-  OPENAI_LARGE_DOC_CHARS?: string
-
-  // ── Kimi (Moonshot AI) provider — ~250K context, multimodal ──
-  /** Optional: Moonshot / Kimi API key. Enables Kimi as a provider + fallback. */
-  KIMI_API_KEY?: string
-  /** Optional: Kimi base URL (default https://api.moonshot.ai/v1). */
-  KIMI_BASE_URL?: string
-  /** Optional: Kimi model (default kimi-k2.6, ~262K context, multimodal). */
-  KIMI_MODEL?: string
-
-  // ── Provider preference & fallback ──
-  /** Optional: preferred provider for text 'openai' | 'kimi' (default openai). Fallback to the other on failure. */
-  PREFERRED_PROVIDER?: string
-  /** Optional: char threshold above which we prefer Kimi single-shot (default 100000). */
-  KIMI_PREFER_DOC_CHARS?: string
 
   // ── Generalized, percentage-based chunking (all optional) ──
   /** Target chunk size as a PERCENT of the document (default 25 → ~4 chunks). */
@@ -70,15 +59,14 @@ export type Bindings = {
   OPENAI_CHUNK_CONTEXT_CHARS?: string
 }
 
-// ── Provider defaults ──
+// ── GPT model defaults (by document type) ──
+const DEFAULT_OPENAI_SHORT_MODEL = 'gpt-4.1-mini'
 const DEFAULT_OPENAI_TEXT_MODEL = 'gpt-4.1'
 const DEFAULT_OPENAI_VISION_MODEL = 'gpt-5.4'
-const DEFAULT_KIMI_MODEL = 'kimi-k2.6'
-const DEFAULT_KIMI_BASE_URL = 'https://api.moonshot.ai/v1'
+const DEFAULT_OPENAI_LARGE_MODEL = 'gpt-4.1'
 const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1'
-// Kimi context is ~262,144 tokens; cap material well under that (leave room for
-// system prompt + JSON output). ~600K chars ≈ ~180K tokens of material.
-const KIMI_MATERIAL_CAP = 600000
+// Text at/below this many chars is treated as a SHORT doc (cheap model).
+const DEFAULT_SHORT_DOC_CHARS = 6000
 
 // The 21-flag framework (weight = max points each flag can contribute)
 export const FLAG_FRAMEWORK = [
@@ -312,7 +300,7 @@ interface ApiConfig {
 }
 
 async function callLlmApi(config: ApiConfig, systemPrompt: string, userContent: any, images: string[]) {
-  const isReasoning = /^(gpt-5|o1|o3|o4|kimi)/i.test(config.model)
+  const isReasoning = /^(gpt-5|o1|o3|o4)/i.test(config.model)
   const reqBody: any = {
     model: config.model,
     messages: [
@@ -370,133 +358,52 @@ function handleApiError(resp: Response, txt: string): never {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  PROVIDERS & FALLBACK
+//  MODEL SELECTION (GPT-only) + SINGLE CALL
 // ════════════════════════════════════════════════════════════════
 
-type ProviderName = 'openai' | 'kimi'
-
-interface Provider {
-  name: ProviderName
-  apiKey: string
-  baseUrl: string
-  /** Pick the model for this provider given whether images are present. */
-  model: (hasImages: boolean) => string
-  /** True if this provider can accept images (vision). */
-  multimodal: boolean
-  reasoningEffort?: string
-}
-
-/** Build the list of AVAILABLE providers (those with an API key set). */
-function buildProviders(env: Bindings): Provider[] {
-  const providers: Provider[] = []
-
-  if (env.OPENAI_API_KEY) {
-    const textModel = env.OPENAI_TEXT_MODEL || DEFAULT_OPENAI_TEXT_MODEL
-    const visionModel = env.OPENAI_VISION_MODEL || DEFAULT_OPENAI_VISION_MODEL
-    providers.push({
-      name: 'openai',
-      apiKey: env.OPENAI_API_KEY,
-      baseUrl: (env.OPENAI_BASE_URL || DEFAULT_OPENAI_BASE_URL).replace(/\/$/, ''),
-      model: (hasImages) => env.OPENAI_MODEL || (hasImages ? visionModel : textModel),
-      multimodal: true, // gpt-5.4 vision path
-      reasoningEffort: env.OPENAI_REASONING_EFFORT,
-    })
-  }
-
-  if (env.KIMI_API_KEY) {
-    const kimiModel = env.KIMI_MODEL || DEFAULT_KIMI_MODEL
-    providers.push({
-      name: 'kimi',
-      apiKey: env.KIMI_API_KEY,
-      baseUrl: (env.KIMI_BASE_URL || DEFAULT_KIMI_BASE_URL).replace(/\/$/, ''),
-      model: () => kimiModel, // kimi-k2.6 handles both text and images
-      multimodal: true,
-      reasoningEffort: env.OPENAI_REASONING_EFFORT,
-    })
-  }
-
-  return providers
-}
-
-/** Order providers by preference for THIS request (routing + fallback order). */
-function orderProviders(
-  providers: Provider[],
-  opts: { hasImages: boolean; docLen: number; preferKimiLarge: boolean; preferred: ProviderName }
-): Provider[] {
-  const withKey = [...providers]
-  // If images present, providers that are multimodal go first.
-  withKey.sort((a, b) => {
-    // 1) multimodal priority when images
-    if (opts.hasImages) {
-      const am = a.multimodal ? 0 : 1
-      const bm = b.multimodal ? 0 : 1
-      if (am !== bm) return am - bm
-    }
-    // 2) for very large TEXT docs, prefer Kimi (single-shot 250K ctx)
-    if (!opts.hasImages && opts.preferKimiLarge) {
-      const ak = a.name === 'kimi' ? 0 : 1
-      const bk = b.name === 'kimi' ? 0 : 1
-      if (ak !== bk) return ak - bk
-    }
-    // 3) otherwise honor the configured preferred provider
-    const ap = a.name === opts.preferred ? 0 : 1
-    const bp = b.name === opts.preferred ? 0 : 1
-    return ap - bp
-  })
-  return withKey
-}
-
-function providerToConfig(p: Provider, hasImages: boolean): ApiConfig {
-  return { apiKey: p.apiKey, baseUrl: p.baseUrl, model: p.model(hasImages), reasoningEffort: p.reasoningEffort }
-}
-
-/** Errors that justify trying the OTHER provider. */
-function isFallbackWorthy(err: any): boolean {
-  const m = String(err?.message || '')
-  return (
-    m.startsWith('SERVICE_QUOTA:') ||
-    m.startsWith('SERVICE_AUTH:') ||
-    m.startsWith('SERVICE_MESSAGE:') ||
-    m.startsWith('Analysis service error (5') || // 5xx
-    m.includes('Analysis service returned an empty response')
-  )
-}
-
 /**
- * Make ONE model call, trying each provider in order until one succeeds.
- * Returns the parsed JSON result. Throws the last error if all providers fail.
+ * Pick the GPT model for a submission by DOCUMENT TYPE.
+ *   images        → OPENAI_VISION_MODEL (gpt-5.4)
+ *   short text    → OPENAI_SHORT_MODEL  (gpt-4.1-mini)
+ *   large/chunked → OPENAI_LARGE_MODEL  (gpt-4.1)
+ *   normal text   → OPENAI_TEXT_MODEL   (gpt-4.1)
+ * OPENAI_MODEL, if set, forces one model for everything.
  */
-async function callParsedWithFallback(
-  ordered: Provider[],
-  hasImages: boolean,
+function pickModel(env: Bindings, opts: { hasImages: boolean; docLen: number; isChunk: boolean }): string {
+  if (env.OPENAI_MODEL) return env.OPENAI_MODEL
+  if (opts.hasImages) return env.OPENAI_VISION_MODEL || DEFAULT_OPENAI_VISION_MODEL
+  if (opts.isChunk) return env.OPENAI_LARGE_MODEL || DEFAULT_OPENAI_LARGE_MODEL
+  const shortCap = Number(env.OPENAI_SHORT_DOC_CHARS) || DEFAULT_SHORT_DOC_CHARS
+  if (opts.docLen <= shortCap) return env.OPENAI_SHORT_MODEL || DEFAULT_OPENAI_SHORT_MODEL
+  return env.OPENAI_TEXT_MODEL || DEFAULT_OPENAI_TEXT_MODEL
+}
+
+function makeConfig(env: Bindings, model: string): ApiConfig {
+  return {
+    apiKey: env.OPENAI_API_KEY as string,
+    baseUrl: (env.OPENAI_BASE_URL || DEFAULT_OPENAI_BASE_URL).replace(/\/$/, ''),
+    model,
+    reasoningEffort: env.OPENAI_REASONING_EFFORT,
+  }
+}
+
+/** Make ONE model call and return the parsed JSON result. */
+async function callParsed(
+  config: ApiConfig,
   systemPrompt: string,
   userContent: any,
   images: string[]
 ): Promise<any> {
-  let lastErr: any
-  for (const p of ordered) {
-    const config = providerToConfig(p, hasImages)
-    try {
-      const resp = await callLlmApi(config, systemPrompt, userContent, images)
-      if (!resp.ok) {
-        const txt = await resp.text().catch(() => '')
-        handleApiError(resp, txt)
-      }
-      const data: any = await resp.json()
-      const content = data?.choices?.[0]?.message?.content
-      const finish = data?.choices?.[0]?.finish_reason
-      if (!content) throw new Error('Analysis service returned an empty response.')
-      return parseResponse(content, finish)
-    } catch (err) {
-      lastErr = err
-      // Not-relevant / truncation are NOT provider problems — don't fall back.
-      const msg = String((err as any)?.message || '')
-      if (msg.startsWith('NOT_RELEVANT:') || msg.startsWith('RESPONSE_TRUNCATED:')) throw err
-      if (!isFallbackWorthy(err)) throw err
-      // else: loop to next provider
-    }
+  const resp = await callLlmApi(config, systemPrompt, userContent, images)
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '')
+    handleApiError(resp, txt)
   }
-  throw lastErr || new Error('All analysis providers are unavailable.')
+  const data: any = await resp.json()
+  const content = data?.choices?.[0]?.message?.content
+  const finish = data?.choices?.[0]?.finish_reason
+  if (!content) throw new Error('Analysis service returned an empty response.')
+  return parseResponse(content, finish)
 }
 
 function parseResponse(content: string, finishReason: string | null): any {
@@ -536,7 +443,7 @@ function parseResponse(content: string, finishReason: string | null): any {
 // ════════════════════════════════════════════════════════════════
 
 async function analyzeOneChunk(
-  ordered: Provider[],
+  config: ApiConfig,
   ctx: string[],
   material: string,
   images: string[],
@@ -569,7 +476,7 @@ async function analyzeOneChunk(
     ? [{ type: 'text', text: textPart }, ...images.map((url: string) => ({ type: 'image_url', image_url: { url } }))]
     : textPart
 
-  return callParsedWithFallback(ordered, hasImages, SYSTEM_PROMPT, userContent, images)
+  return callParsed(config, SYSTEM_PROMPT, userContent, images)
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -680,10 +587,9 @@ function mergeChunkResults(results: any[]): any {
 // ════════════════════════════════════════════════════════════════
 
 export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
-  // ── Build available providers (each needs its own key) ──
-  const providers = buildProviders(env)
-  if (providers.length === 0) {
-    throw new Error('Analysis service is not configured. (Set OPENAI_API_KEY and/or KIMI_API_KEY.)')
+  // ── GPT-only: a single OpenAI key drives every route ──
+  if (!env.OPENAI_API_KEY) {
+    throw new Error('Analysis service is not configured. (Set OPENAI_API_KEY.)')
   }
 
   const ctx: string[] = []
@@ -697,43 +603,23 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
   const hasImages = images.length > 0
   const rawMaterial = (input.material || '').trim()
 
-  // ── Provider preference + routing ──
-  const preferred: ProviderName = (env.PREFERRED_PROVIDER === 'kimi' ? 'kimi' : 'openai')
-  const kimiAvailable = providers.some((p) => p.name === 'kimi')
-  const KIMI_PREFER_DOC_CHARS = Number(env.KIMI_PREFER_DOC_CHARS) || 100000
-
-  // For very large TEXT docs, prefer Kimi single-shot (250K ctx) if we can fit
-  // the whole doc under Kimi's material cap — avoids many sequential chunks.
-  const fitsKimiSingleShot = rawMaterial.length <= KIMI_MATERIAL_CAP
-  const preferKimiLarge =
-    !hasImages && kimiAvailable && fitsKimiSingleShot && rawMaterial.length >= KIMI_PREFER_DOC_CHARS
-
   // ── Percentage-based chunk plan (generalized to any size) ──
   const plan = computeChunkPlan(env, rawMaterial.length)
 
-  // A single call can hold the whole doc if:
-  //   • it fits one OpenAI chunk (<= plan.maxChunk), OR
-  //   • we're routing to Kimi single-shot for a large text doc.
-  const singleShot =
-    hasImages ||
-    rawMaterial.length <= plan.maxChunk ||
-    preferKimiLarge
+  // A single call can hold the whole doc if it has images (single vision call)
+  // or it already fits one OpenAI chunk (<= plan.maxChunk).
+  const singleShot = hasImages || rawMaterial.length <= plan.maxChunk
 
   let results: any[]
 
   if (singleShot) {
-    // ── SINGLE SHOT (image OR small doc OR Kimi-large-text) ──
-    // Order providers so the right one is primary; the other is the fallback.
-    const ordered = orderProviders(providers, {
-      hasImages,
-      docLen: rawMaterial.length,
-      preferKimiLarge,
-      preferred,
-    })
+    // ── SINGLE SHOT (image OR doc that fits one chunk) ──
+    // Model is chosen by document type: images → vision; short text → short
+    // model; normal text → text model.
+    const model = pickModel(env, { hasImages, docLen: rawMaterial.length, isChunk: false })
+    const config = makeConfig(env, model)
 
-    // If routing to Kimi for a huge doc, cap material to Kimi's safe window;
-    // otherwise send the full doc (it already fits an OpenAI chunk, or has images).
-    const cap = preferKimiLarge ? KIMI_MATERIAL_CAP : Math.max(plan.maxChunk, rawMaterial.length)
+    const cap = Math.max(plan.maxChunk, rawMaterial.length)
     const material = rawMaterial.slice(0, cap)
     const wasTruncated = rawMaterial.length > cap
 
@@ -752,36 +638,29 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
       ? [{ type: 'text', text: textPart }, ...images.map((url) => ({ type: 'image_url', image_url: { url } }))]
       : textPart
 
-    results = [await callParsedWithFallback(ordered, hasImages, SYSTEM_PROMPT, userContent, images)]
+    results = [await callParsed(config, SYSTEM_PROMPT, userContent, images)]
 
   } else {
     // ── LARGE TEXT DOC: SEQUENTIAL CHUNKING WITH % CARRYOVER ──
     // Chunk size and carryover both come from the percentage-based plan.
+    // Large/chunked text routes to the "large" GPT model.
     const chunks = splitIntoChunks(rawMaterial, plan.chunkSize, CHUNK_OVERLAP)
 
-    // Order providers once for text chunks (no images on most chunks).
-    const orderedText = orderProviders(providers, {
-      hasImages: false,
-      docLen: rawMaterial.length,
-      preferKimiLarge: false, // chunking path is OpenAI-style; Kimi still usable as fallback
-      preferred,
-    })
-    const orderedImg = orderProviders(providers, {
-      hasImages: true,
-      docLen: rawMaterial.length,
-      preferKimiLarge: false,
-      preferred,
-    })
+    const textModel = pickModel(env, { hasImages: false, docLen: rawMaterial.length, isChunk: true })
+    const textConfig = makeConfig(env, textModel)
+    const imgConfig = hasImages
+      ? makeConfig(env, pickModel(env, { hasImages: true, docLen: rawMaterial.length, isChunk: true }))
+      : textConfig
 
     results = []
     let carryover = ''
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i]
       const chunkHasImages = i === 0 && hasImages
-      const ordered = chunkHasImages ? orderedImg : orderedText
+      const config = chunkHasImages ? imgConfig : textConfig
 
       const res = await analyzeOneChunk(
-        ordered,
+        config,
         ctx,
         chunk,
         chunkHasImages ? images : [],
