@@ -107,14 +107,15 @@
     const buf = await readAsArrayBuffer(file);
     const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
     let out = '';
-    const pages = Math.min(pdf.numPages, 400);
+    const pages = Math.min(pdf.numPages, 2000);
     for (let i = 1; i <= pages; i++) {
       const page = await pdf.getPage(i);
       const content = await page.getTextContent();
       out += content.items.map((it) => it.str).join(' ') + '\n\n';
-      // Backend analyzes the first ~120k chars (the stable sweet spot); pull a
-      // small margin beyond that so nothing meaningful is lost, then stop.
-      if (out.length > 150000) break;
+      // The backend now handles unlimited size (chunk-and-merge, and Kimi 2.6's
+      // 2M-token context for very large docs). Extract the full document up to a
+      // generous safety cap so nothing meaningful is lost.
+      if (out.length > 2000000) break;
     }
     return out.trim();
   }

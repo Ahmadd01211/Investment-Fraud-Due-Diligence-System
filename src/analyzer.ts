@@ -553,8 +553,9 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
     // ── OPENAI-COMPATIBLE: CHUNK OR SINGLE SHOT ──
     const MAX_MATERIAL = Number(env.OPENAI_MAX_MATERIAL_CHARS) || CHUNK_SIZE
 
-    if (rawMaterial.length <= MAX_MATERIAL && !hasImages) {
-      // Small doc + no images → single shot (fast, cheap)
+    if (rawMaterial.length <= MAX_MATERIAL) {
+      // Doc fits in one chunk → single shot (fast, cheap). Images ALWAYS use the
+      // vision model here so screenshots/pitch-deck pages are read correctly.
       const textModel = env.OPENAI_TEXT_MODEL || 'gpt-5.4-mini'
       const visionModel = env.OPENAI_VISION_MODEL || 'gpt-5.4'
       const largeModel = env.OPENAI_LARGE_MODEL || textModel
@@ -604,10 +605,12 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
       // ── LARGE DOC: CHUNK + PARALLEL ANALYZE ──
       const chunks = splitIntoChunks(rawMaterial, MAX_MATERIAL, CHUNK_OVERLAP)
 
-      // For chunking, use the large model if configured, otherwise text model
+      // For chunking, use the large model if configured, otherwise text model.
+      // If images are attached (to chunk 0), prefer the vision model so they're read.
       const textModel = env.OPENAI_TEXT_MODEL || 'gpt-5.4-mini'
+      const visionModel = env.OPENAI_VISION_MODEL || 'gpt-5.4'
       const largeModel = env.OPENAI_LARGE_MODEL || textModel
-      const chunkModel = env.OPENAI_MODEL || largeModel
+      const chunkModel = env.OPENAI_MODEL || (hasImages ? visionModel : largeModel)
 
       const config: ApiConfig = {
         apiKey,
