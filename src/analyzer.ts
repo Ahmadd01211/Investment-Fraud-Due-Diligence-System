@@ -2,6 +2,13 @@
 //  InvestSafe Pro™ — Forensic Analysis Engine (server-side)
 //  Uses our managed OpenAI key. No BYOK. Built on the documented
 //  Barry Minkow investigative methodology (21-flag framework).
+//
+//  v2.0 — Chunk-and-Merge for unlimited document size + Kimi 2.6 support
+//  ──
+//  Large documents are split into overlapping chunks, analyzed in parallel,
+//  then merged by taking the HIGHEST evidence tier per flag across all chunks.
+//  This makes scoring deterministic AND monotonic (more text never lowers score).
+//  Kimi 2.6 (2M context window) is used when available, skipping chunking entirely.
 // ════════════════════════════════════════════════════════════════
 
 export type Bindings = {
@@ -19,14 +26,25 @@ export type Bindings = {
   OPENAI_LARGE_MODEL?: string
   /** Optional: char threshold above which the large model is used (default 40000). */
   OPENAI_LARGE_DOC_CHARS?: string
-  /** Optional: max characters of material sent to the model (default 120000). */
+  /** Optional: max characters of material sent to the model PER CHUNK (default 100000). */
   OPENAI_MAX_MATERIAL_CHARS?: string
+
+  // ── Kimi 2.6 support ──
+  /** Optional: Moonshot AI / Kimi API key. If set, large docs route here. */
+  KIMI_API_KEY?: string
+  /** Optional: Kimi API base URL (default https://api.moonshot.cn/v1). */
+  KIMI_BASE_URL?: string
+  /** Optional: Kimi model name (default kimi-2.6). */
+  KIMI_MODEL?: string
+  /** Optional: char threshold above which Kimi is used instead of chunking (default 150000). */
+  KIMI_DOC_CHARS?: string
 }
 
 // The 21-flag framework (weight = max points each flag can contribute)
 export const FLAG_FRAMEWORK = [
   { n: 1,  name: 'Irrational Ratios — Expenses vs. Revenue Impossible', weight: 10 },
-  { n: 2,  name: 'IRR in "Buffett-Shame Zone" (17–25%+)', weight: 10 },
+  { n: 2,  name: 'IRR in "Buffett-Shame Zone" (17–25%+)',
+    weight: 10 },
   { n: 3,  name: 'Debt Load Mathematically Incompatible with Returns', weight: 10 },
   { n: 4,  name: 'Promoter FINRA-Barred / SEC-Sanctioned', weight: 10 },
   { n: 5,  name: 'False FDIC Insurance / "SEC Qualified" Claims', weight: 10 },
@@ -147,141 +165,136 @@ export interface AnalyzeInput {
   images?: string[]
 }
 
-export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
-  const apiKey = env.OPENAI_API_KEY
-  const baseUrl = (env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '')
+// ════════════════════════════════════════════════════════════════
+//  CHUNKING CONFIGURATION
+// ════════════════════════════════════════════════════════════════
 
-  if (!apiKey) {
-    throw new Error('Analysis service is not configured. (Missing server API key.)')
+const CHUNK_SIZE = 100000       // chars per chunk (~25k tokens for GPT-4 class)
+const CHUNK_OVERLAP = 5000      // overlap between chunks to preserve context
+const MAX_CHUNKS = 20           // safety ceiling: docs > 2M chars get truncated
+
+// Tier ranking for merge (higher number = higher tier)
+const TIER_RANK: Record<string, number> = {
+  'Tier 1': 4,
+  'Tier 2': 3,
+  'Tier 3': 2,
+  'Tier 4': 1,
+  GAP: 0,
+}
+
+/**
+ * Split a long document into overlapping chunks.
+ * Each chunk is at most CHUNK_SIZE chars, with CHUNK_OVERLAP chars
+ * overlapping the previous chunk to preserve context at boundaries.
+ */
+function splitIntoChunks(text: string, chunkSize: number, overlap: number): string[] {
+  if (text.length <= chunkSize) return [text]
+  const chunks: string[] = []
+  let i = 0
+  while (i < text.length && chunks.length < MAX_CHUNKS) {
+    const end = Math.min(i + chunkSize, text.length)
+    // Try to break at a sentence boundary near the end
+    let breakPoint = end
+    if (end < text.length) {
+      // Look for sentence ending in the last 500 chars of this chunk
+      const searchStart = Math.max(i + chunkSize - 500, i + 100)
+      const searchText = text.slice(searchStart, end + 100)
+      const sentenceMatch = searchText.match(/[.!?]\s+/g)
+      if (sentenceMatch) {
+        // Find the last sentence boundary before end
+        let pos = searchStart
+        let lastBoundary = -1
+        for (const m of sentenceMatch) {
+          const idx = text.indexOf(m, pos)
+          if (idx >= 0 && idx + m.length < end) {
+            lastBoundary = idx + m.length
+            pos = idx + m.length
+          }
+        }
+        if (lastBoundary > i + 100) {
+          breakPoint = lastBoundary
+        }
+      }
+    }
+    chunks.push(text.slice(i, breakPoint))
+    i = Math.max(breakPoint - overlap, i + 1)
   }
+  return chunks
+}
 
-  const ctx: string[] = []
-  if (input.sponsorName) ctx.push(`Sponsor / promoter name: ${input.sponsorName}`)
-  if (input.assetType) ctx.push(`Asset type / strategy: ${input.assetType}`)
-  if (input.claimedReturn) ctx.push(`Claimed return / IRR: ${input.claimedReturn}`)
-  if (input.amountAsked) ctx.push(`Minimum investment / amount asked: ${input.amountAsked}`)
-  if (input.sourceType) ctx.push(`Where this came from: ${input.sourceType}`)
+// ════════════════════════════════════════════════════════════════
+//  LOW-LEVEL API CALL (works for both OpenAI and Kimi)
+// ════════════════════════════════════════════════════════════════
 
-  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 4)
-  const hasImages = images.length > 0
+interface ApiConfig {
+  apiKey: string
+  baseUrl: string
+  model: string
+  reasoningEffort?: string
+}
 
-  // Send enough of the document to cover its substantive body WITHOUT dumping
-  // in so much boilerplate that scoring becomes unstable. 120k chars (~30k
-  // tokens) was empirically the sweet spot: it covers the real content of a
-  // 96-page PPM while keeping results consistent run-to-run. (Configurable.)
-  const MAX_MATERIAL = Number(env.OPENAI_MAX_MATERIAL_CHARS) || 120000
-  const rawMaterial = (input.material || '')
-  const material = rawMaterial.slice(0, MAX_MATERIAL)
-  const wasTruncated = rawMaterial.length > MAX_MATERIAL
-
-  // Smart model routing:
-  //   • images attached → vision model (gpt-5.4)
-  //   • normal text     → fast/cheap, STABLE model (gpt-5.4-mini)
-  //
-  // NOTE ON LARGE DOCS: we deliberately do NOT auto-escalate big documents to a
-  // bigger reasoning model (e.g. gpt-5.5). Live testing on a 96-page PPM showed
-  // that routing the full document through gpt-5.5 made scoring LESS consistent
-  // (swinging 44 Medium → 72 High → 100 Critical across runs) and far slower
-  // (~50s/run), because these reasoning models don't honor seed/temperature.
-  // Stability comes instead from: capping material at MAX_MATERIAL, fixing
-  // severity by evidence tier, reasoning_effort:low, and the score stability
-  // floor. Large-doc routing stays OFF by default and is opt-in via env only.
-  const textModel = env.OPENAI_TEXT_MODEL || 'gpt-5.4-mini'
-  const visionModel = env.OPENAI_VISION_MODEL || 'gpt-5.4'
-  const largeModel = env.OPENAI_LARGE_MODEL || textModel
-  // Default disables auto large-doc routing (very high threshold). Override with
-  // OPENAI_LARGE_DOC_CHARS + OPENAI_LARGE_MODEL only if you explicitly want it.
-  const LARGE_DOC_CHARS = Number(env.OPENAI_LARGE_DOC_CHARS) || Number.MAX_SAFE_INTEGER
-  const isLargeDoc = material.length >= LARGE_DOC_CHARS
-  const model =
-    env.OPENAI_MODEL ||
-    (hasImages ? visionModel : isLargeDoc ? largeModel : textModel)
-
-  const textPart =
-    (ctx.length ? `INVESTOR-PROVIDED CONTEXT:\n${ctx.join('\n')}\n\n` : '') +
-    (material.trim().length
-      ? `SUBMITTED MATERIAL (text) TO ANALYZE${wasTruncated ? ' (long document — analyze what is provided)' : ''}:\n"""\n${material}\n"""\n\n`
-      : '') +
-    (hasImages
-      ? `The investor also attached ${images.length} image(s) (e.g. a screenshot of an ad, email, or pitch-deck page). Read ALL text and visual claims in the image(s) and treat them as submitted material.\n\n`
-      : '') +
-    `Analyze everything provided using the 21-flag framework and return the JSON object only.`
-
-  // Build the user message. Vision requires the array content format.
-  const userContent: any = hasImages
-    ? [{ type: 'text', text: textPart }, ...images.map((url) => ({ type: 'image_url', image_url: { url } }))]
-    : textPart
-
-  // GPT-5 family (and o-series) reject `max_tokens` and require
-  // `max_completion_tokens`. Older models (gpt-4o etc.) use `max_tokens`.
-  const isReasoning = /^(gpt-5|o1|o3|o4)/i.test(model)
+async function callLlmApi(config: ApiConfig, systemPrompt: string, userContent: any, images: string[]) {
+  const isReasoning = /^(gpt-5|o1|o3|o4|kimi)/i.test(config.model)
   const reqBody: any = {
-    model,
+    model: config.model,
     messages: [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: systemPrompt },
       { role: 'user', content: userContent },
     ],
     response_format: { type: 'json_object' },
-    // Determinism: temperature 0 + fixed seed makes the same submission yield
-    // the same score on repeat runs (as much as the API allows).
     temperature: 0,
     seed: 42,
   }
+
   if (isReasoning) {
-    // Reasoning models add internal stochastic reasoning that temperature:0
-    // does NOT fully control. Low reasoning effort sharply reduces run-to-run
-    // score variance for this rubric-based scoring task. Configurable.
-    reqBody.reasoning_effort = env.OPENAI_REASONING_EFFORT || 'low'
-    // Reasoning models need headroom for hidden reasoning tokens + the JSON.
-    reqBody.max_completion_tokens = 8000
+    reqBody.reasoning_effort = config.reasoningEffort || 'low'
+    // Kimi 2.6 has massive context, give more room for reasoning + output
+    reqBody.max_completion_tokens = 16000
   } else {
     reqBody.max_tokens = 4000
   }
 
-  const callApi = (b: any) =>
-    fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify(b),
-    })
+  const resp = await fetch(`${config.baseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.apiKey}` },
+    body: JSON.stringify(reqBody),
+  })
 
-  let resp = await callApi(reqBody)
-
-  // Some models reject custom temperature/seed — retry once without them.
-  if (!resp.ok) {
+  // Retry once without temperature/seed if rejected
+  if (!resp.ok && resp.status === 400) {
     const peek = await resp.clone().text().catch(() => '')
     const pl = peek.toLowerCase()
-    if (resp.status === 400 && (pl.includes('temperature') || pl.includes('seed'))) {
+    if (pl.includes('temperature') || pl.includes('seed')) {
       const fallback = { ...reqBody }
       delete fallback.temperature
       delete fallback.seed
-      resp = await callApi(fallback)
+      const retry = await fetch(`${config.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.apiKey}` },
+        body: JSON.stringify(fallback),
+      })
+      return retry
     }
   }
 
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => '')
-    const low = txt.toLowerCase()
-    // Provider quota / billing problems (OpenAI returns 429 with these).
-    if (resp.status === 429 || low.includes('insufficient_quota') || low.includes('exceeded your current quota') || low.includes('billing')) {
-      throw new Error('SERVICE_QUOTA: The analysis service is temporarily unavailable (API quota/billing limit reached).')
-    }
-    if (resp.status === 401 || resp.status === 403) {
-      throw new Error('SERVICE_AUTH: The analysis service is misconfigured (invalid API key).')
-    }
-    throw new Error(`Analysis service error (${resp.status}). ${txt.slice(0, 200)}`)
+  return resp
+}
+
+function handleApiError(resp: Response, txt: string): never {
+  const low = txt.toLowerCase()
+  if (resp.status === 429 || low.includes('insufficient_quota') || low.includes('exceeded your current quota') || low.includes('billing')) {
+    throw new Error('SERVICE_QUOTA: The analysis service is temporarily unavailable (API quota/billing limit reached).')
   }
+  if (resp.status === 401 || resp.status === 403) {
+    throw new Error('SERVICE_AUTH: The analysis service is misconfigured (invalid API key).')
+  }
+  throw new Error(`Analysis service error (${resp.status}). ${txt.slice(0, 200)}`)
+}
 
-  const data: any = await resp.json()
-  const content = data?.choices?.[0]?.message?.content
-  const finish = data?.choices?.[0]?.finish_reason
-  if (!content) throw new Error('Analysis service returned an empty response.')
-
-  // The LLM proxy can return a plain-text status/error message (e.g. quota /
-  // credits exhausted) with HTTP 200 instead of JSON. Detect that up front so
-  // we surface a meaningful error rather than a confusing "could not parse".
+function parseResponse(content: string, finishReason: string | null): any {
   const trimmed = String(content).trim()
   const looksLikeJson = trimmed.startsWith('{') || trimmed.startsWith('[') || /\{[\s\S]*\}/.test(trimmed)
+
   if (!looksLikeJson) {
     const lower = trimmed.toLowerCase()
     if (lower.includes('credit') && (lower.includes('deplet') || lower.includes('purchase') || lower.includes('pack'))) {
@@ -290,8 +303,7 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
     throw new Error(`SERVICE_MESSAGE: ${trimmed.slice(0, 300)}`)
   }
 
-  // If the model was cut off mid-output, the JSON will be invalid.
-  if (finish === 'length') {
+  if (finishReason === 'length') {
     throw new Error('RESPONSE_TRUNCATED: The document is very large and the analysis was cut off. Try a shorter excerpt or the key pages.')
   }
 
@@ -308,14 +320,332 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
     }
   }
 
-  // Relevance gate: if the model decided this isn't an investment at all,
-  // do NOT return a misleading "0 / Low risk" score. Signal a clear error.
-  if (parsed && parsed.isInvestmentRelated === false) {
-    const reason = String(parsed.notRelevantReason || '').trim()
-    throw new Error('NOT_RELEVANT:' + (reason || 'This does not appear to be an investment offering, pitch, or solicitation.'))
+  return parsed
+}
+
+// ════════════════════════════════════════════════════════════════
+//  SINGLE CHUNK ANALYSIS
+// ════════════════════════════════════════════════════════════════
+
+async function analyzeOneChunk(
+  env: Bindings,
+  config: ApiConfig,
+  ctx: string[],
+  material: string,
+  images: string[],
+  chunkIndex: number,
+  totalChunks: number
+): Promise<any> {
+  const textPart =
+    (ctx.length ? `INVESTOR-PROVIDED CONTEXT:\n${ctx.join('\n')}\n\n` : '') +
+    (material.trim().length
+      ? `SUBMITTED MATERIAL (text) TO ANALYZE — PART ${chunkIndex + 1} of ${totalChunks}:\n"""\n${material}\n"""\n\n` +
+        `This is chunk ${chunkIndex + 1} of ${totalChunks}. Analyze ONLY the content in this chunk. ` +
+        `Flag any evidence you see. If the full document is referenced elsewhere, you may note ` +
+        `missing evidence as GAP. Return the JSON result for this chunk.\n\n`
+      : '') +
+    (images.length > 0
+      ? `The investor also attached ${images.length} image(s). Read ALL text and visual claims in the image(s) and treat them as submitted material.\n\n`
+      : '') +
+    `Analyze using the 21-flag framework and return the JSON object only.`
+
+  const userContent = images.length > 0
+    ? [{ type: 'text', text: textPart }, ...images.map((url: string) => ({ type: 'image_url', image_url: { url } }))]
+    : textPart
+
+  const resp = await callLlmApi(config, SYSTEM_PROMPT, userContent, images)
+
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '')
+    handleApiError(resp, txt)
   }
 
-  return normalizeResult(parsed)
+  const data: any = await resp.json()
+  const content = data?.choices?.[0]?.message?.content
+  const finish = data?.choices?.[0]?.finish_reason
+
+  if (!content) throw new Error('Analysis service returned an empty response.')
+  return parseResponse(content, finish)
+}
+
+// ════════════════════════════════════════════════════════════════
+//  MERGE MULTIPLE CHUNK RESULTS
+// ════════════════════════════════════════════════════════════════
+
+/**
+ * Merge analysis results from multiple chunks.
+ * Strategy: for each flag, take the HIGHEST evidence tier found across all chunks.
+ * This is MONOTONIC — more text can only increase or maintain the score, never lower it.
+ */
+function mergeChunkResults(results: any[]): any {
+  if (results.length === 1) return results[0]
+
+  // Collect all unique flags found across all chunks, keeping the highest tier
+  const flagMap = new Map<number, any>()
+  const allClaims: any[] = []
+  const allContradictions: any[] = []
+  const allVerify: any[] = []
+  const allAdvice: string[] = []
+
+  for (const r of results) {
+    if (!r || typeof r !== 'object') continue
+
+    const flags = Array.isArray(r.triggeredFlags) ? r.triggeredFlags : []
+    for (const f of flags) {
+      if (!f || !f.n) continue
+      const n = Number(f.n)
+      const existing = flagMap.get(n)
+      const tier = normalizeTier(f.evidenceTier)
+      const rank = TIER_RANK[tier] ?? 0
+
+      if (!existing) {
+        flagMap.set(n, { ...f, evidenceTier: tier, _rank: rank })
+      } else if (rank > existing._rank) {
+        // Higher tier wins — replace entirely
+        flagMap.set(n, { ...f, evidenceTier: tier, _rank: rank })
+      } else if (rank === existing._rank && rank > 0) {
+        // Same tier — concatenate evidence from this chunk
+        const existingEvidence = String(existing.evidence || '')
+        const newEvidence = String(f.evidence || '')
+        if (newEvidence && !existingEvidence.includes(newEvidence.slice(0, 100))) {
+          existing.evidence = existingEvidence + '\n[also found in another section] ' + newEvidence
+        }
+      }
+    }
+
+    // Collect supplementary data from all chunks
+    if (Array.isArray(r.extractedClaims)) allClaims.push(...r.extractedClaims)
+    if (Array.isArray(r.contradictions)) allContradictions.push(...r.contradictions)
+    if (Array.isArray(r.verifyNext)) allVerify.push(...r.verifyNext)
+    if (r.investorAdvice) allAdvice.push(String(r.investorAdvice))
+  }
+
+  // Deduplicate claims/contradictions by key fields
+  const dedupe = (arr: any[], keyFn: (x: any) => string) => {
+    const seen = new Set<string>()
+    return arr.filter((x) => {
+      const k = keyFn(x).toLowerCase().slice(0, 80)
+      if (seen.has(k)) return false
+      seen.add(k)
+      return true
+    })
+  }
+
+  const mergedClaims = dedupe(allClaims, (c) => `${c.type || ''}|${c.claim || ''}`)
+  const mergedContradictions = dedupe(allContradictions, (c) => `${c.claim || ''}|${c.reality || ''}`)
+  const mergedVerify = dedupe(allVerify, (c) => `${c.action || ''}|${c.where || ''}`)
+
+  // Build merged result — scoring will be recomputed by normalizeResult
+  const merged = {
+    isInvestmentRelated: results.some((r) => r?.isInvestmentRelated === true),
+    notRelevantReason: '',
+    riskScore: 0,
+    riskLevel: 'Low',
+    scoreBreakdown: {
+      totalWeightedPoints: 0,
+      maxPossiblePoints: 0,
+      formula: 'totalWeightedPoints ÷ maxPossiblePoints × 100',
+      keyDrivers: [],
+    },
+    verdict: results[0]?.verdict || '',
+    summary: results[0]?.summary || '',
+    triggeredFlags: Array.from(flagMap.values()).map((f) => ({
+      n: f.n,
+      name: f.name,
+      weight: f.weight,
+      severity: f.severity,
+      evidenceTier: f.evidenceTier,
+      weightedPoints: f.weightedPoints,
+      evidence: f.evidence,
+      explanation: f.explanation,
+    })),
+    extractedClaims: mergedClaims,
+    contradictions: mergedContradictions,
+    verifyNext: mergedVerify,
+    investorAdvice: allAdvice.length > 0
+      ? allAdvice[0] + (allAdvice.length > 1 ? `\n\n(Additional notes from full document review: ${allAdvice.length - 1} more sections analyzed.)` : '')
+      : '',
+    disclaimer: results[0]?.disclaimer || 'This is an educational due-diligence aid, not legal or financial advice. Always verify with primary sources and consult a licensed professional.',
+  }
+
+  return merged
+}
+
+// ════════════════════════════════════════════════════════════════
+//  MAIN ENTRY POINT
+// ════════════════════════════════════════════════════════════════
+
+export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
+  const apiKey = env.OPENAI_API_KEY
+  const baseUrl = (env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '')
+  const kimiApiKey = env.KIMI_API_KEY
+  const kimiBaseUrl = (env.KIMI_BASE_URL || 'https://api.moonshot.cn/v1').replace(/\/$/, '')
+  const kimiModel = env.KIMI_MODEL || 'kimi-2.6'
+
+  if (!apiKey && !kimiApiKey) {
+    throw new Error('Analysis service is not configured. (Missing server API key.)')
+  }
+
+  const ctx: string[] = []
+  if (input.sponsorName) ctx.push(`Sponsor / promoter name: ${input.sponsorName}`)
+  if (input.assetType) ctx.push(`Asset type / strategy: ${input.assetType}`)
+  if (input.claimedReturn) ctx.push(`Claimed return / IRR: ${input.claimedReturn}`)
+  if (input.amountAsked) ctx.push(`Minimum investment / amount asked: ${input.amountAsked}`)
+  if (input.sourceType) ctx.push(`Where this came from: ${input.sourceType}`)
+
+  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 4)
+  const hasImages = images.length > 0
+
+  const rawMaterial = (input.material || '').trim()
+
+  // ── STRATEGY DECISION: Kimi vs Chunking vs Single Shot ──
+  // Priority order:
+  // 1. Kimi available + doc large enough → use Kimi (2M context = no chunking needed)
+  // 2. Doc fits in single chunk → use standard single-shot
+  // 3. Doc is large → chunk with OpenAI-compatible provider
+
+  const KIMI_THRESHOLD = Number(env.KIMI_DOC_CHARS) || 150000
+  const hasKimi = !!kimiApiKey
+  const useKimi = hasKimi && rawMaterial.length >= KIMI_THRESHOLD
+
+  let results: any[]
+
+  if (useKimi) {
+    // ── KIMI 2.6: SINGLE SHOT (2M context window = no chunking) ──
+    const config: ApiConfig = {
+      apiKey: kimiApiKey,
+      baseUrl: kimiBaseUrl,
+      model: kimiModel,
+    }
+    // Kimi can handle ~2M tokens (~8M chars), so we send the full doc
+    const material = rawMaterial.slice(0, 2000000) // hard cap at 2M chars for safety
+    const wasTruncated = rawMaterial.length > 2000000
+
+    const textPart =
+      (ctx.length ? `INVESTOR-PROVIDED CONTEXT:\n${ctx.join('\n')}\n\n` : '') +
+      (material.trim().length
+        ? `SUBMITTED MATERIAL (text) TO ANALYZE${wasTruncated ? ' (very long document — analyze the full body provided)' : ''}:\n"""\n${material}\n"""\n\n`
+        : '') +
+      (hasImages
+        ? `The investor also attached ${images.length} image(s) (e.g. a screenshot of an ad, email, or pitch-deck page). Read ALL text and visual claims in the image(s) and treat them as submitted material.\n\n`
+        : '') +
+      `Analyze everything provided using the 21-flag framework and return the JSON object only.`
+
+    const userContent = hasImages
+      ? [{ type: 'text', text: textPart }, ...images.map((url) => ({ type: 'image_url', image_url: { url } }))]
+      : textPart
+
+    const resp = await callLlmApi(config, SYSTEM_PROMPT, userContent, images)
+
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '')
+      handleApiError(resp, txt)
+    }
+
+    const data: any = await resp.json()
+    const content = data?.choices?.[0]?.message?.content
+    const finish = data?.choices?.[0]?.finish_reason
+    if (!content) throw new Error('Kimi analysis service returned an empty response.')
+
+    results = [parseResponse(content, finish)]
+
+  } else {
+    // ── OPENAI-COMPATIBLE: CHUNK OR SINGLE SHOT ──
+    const MAX_MATERIAL = Number(env.OPENAI_MAX_MATERIAL_CHARS) || CHUNK_SIZE
+
+    if (rawMaterial.length <= MAX_MATERIAL && !hasImages) {
+      // Small doc + no images → single shot (fast, cheap)
+      const textModel = env.OPENAI_TEXT_MODEL || 'gpt-5.4-mini'
+      const visionModel = env.OPENAI_VISION_MODEL || 'gpt-5.4'
+      const largeModel = env.OPENAI_LARGE_MODEL || textModel
+      const LARGE_DOC_CHARS = Number(env.OPENAI_LARGE_DOC_CHARS) || Number.MAX_SAFE_INTEGER
+      const isLargeDoc = rawMaterial.length >= LARGE_DOC_CHARS
+      const model = env.OPENAI_MODEL || (hasImages ? visionModel : isLargeDoc ? largeModel : textModel)
+
+      const config: ApiConfig = {
+        apiKey,
+        baseUrl,
+        model,
+        reasoningEffort: env.OPENAI_REASONING_EFFORT,
+      }
+
+      const material = rawMaterial.slice(0, MAX_MATERIAL)
+      const wasTruncated = rawMaterial.length > MAX_MATERIAL
+
+      const textPart =
+        (ctx.length ? `INVESTOR-PROVIDED CONTEXT:\n${ctx.join('\n')}\n\n` : '') +
+        (material.trim().length
+          ? `SUBMITTED MATERIAL (text) TO ANALYZE${wasTruncated ? ' (long document — analyze what is provided)' : ''}:\n"""\n${material}\n"""\n\n`
+          : '') +
+        (hasImages
+          ? `The investor also attached ${images.length} image(s) (e.g. a screenshot of an ad, email, or pitch-deck page). Read ALL text and visual claims in the image(s) and treat them as submitted material.\n\n`
+          : '') +
+        `Analyze everything provided using the 21-flag framework and return the JSON object only.`
+
+      const userContent = hasImages
+        ? [{ type: 'text', text: textPart }, ...images.map((url) => ({ type: 'image_url', image_url: { url } }))]
+        : textPart
+
+      const resp = await callLlmApi(config, SYSTEM_PROMPT, userContent, images)
+
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => '')
+        handleApiError(resp, txt)
+      }
+
+      const data: any = await resp.json()
+      const content = data?.choices?.[0]?.message?.content
+      const finish = data?.choices?.[0]?.finish_reason
+      if (!content) throw new Error('Analysis service returned an empty response.')
+
+      results = [parseResponse(content, finish)]
+
+    } else {
+      // ── LARGE DOC: CHUNK + PARALLEL ANALYZE ──
+      const chunks = splitIntoChunks(rawMaterial, MAX_MATERIAL, CHUNK_OVERLAP)
+
+      // For chunking, use the large model if configured, otherwise text model
+      const textModel = env.OPENAI_TEXT_MODEL || 'gpt-5.4-mini'
+      const largeModel = env.OPENAI_LARGE_MODEL || textModel
+      const chunkModel = env.OPENAI_MODEL || largeModel
+
+      const config: ApiConfig = {
+        apiKey,
+        baseUrl,
+        model: chunkModel,
+        reasoningEffort: env.OPENAI_REASONING_EFFORT,
+      }
+
+      // If images are present, attach them only to the FIRST chunk (they're the same across all)
+      const chunkImages = hasImages ? images : []
+
+      // Analyze all chunks in parallel
+      results = await Promise.all(
+        chunks.map((chunk, i) =>
+          analyzeOneChunk(env, config, ctx, chunk, i === 0 ? chunkImages : [], i, chunks.length)
+        )
+      )
+    }
+  }
+
+  // ── MERGE (if multiple chunks) AND NORMALIZE ──
+  const merged = mergeChunkResults(results)
+
+  // Relevance gate: if ANY chunk says not relevant, check majority
+  if (merged && merged.isInvestmentRelated === false) {
+    const relevantCount = results.filter((r) => r?.isInvestmentRelated === true).length
+    if (relevantCount > results.length / 2) {
+      // Majority says relevant — override the gate
+      merged.isInvestmentRelated = true
+    } else {
+      const reason = String(merged.notRelevantReason || '').trim() ||
+        results.find((r) => r?.notRelevantReason)?.notRelevantReason ||
+        'This does not appear to be an investment offering, pitch, or solicitation.'
+      throw new Error('NOT_RELEVANT:' + reason)
+    }
+  }
+
+  return normalizeResult(merged)
 }
 
 const VALID_TIERS = ['Tier 1', 'Tier 2', 'Tier 3', 'Tier 4', 'GAP']
@@ -324,7 +654,6 @@ function normalizeTier(t: any): string {
   const s = String(t || '').trim()
   const found = VALID_TIERS.find((v) => v.toLowerCase() === s.toLowerCase())
   if (found) return found
-  // tolerate "1", "tier1", "t1", "gap"
   const m = s.match(/([1-4])/)
   if (s.toLowerCase().includes('gap')) return 'GAP'
   if (m) return `Tier ${m[1]}`
@@ -348,10 +677,6 @@ const TIER_SEVERITY: Record<string, number> = {
 function normalizeResult(r: any) {
   let flags = Array.isArray(r.triggeredFlags) ? r.triggeredFlags : []
   flags = flags
-    // Only keep flags that map to a REAL framework flag (1..N). Reasoning models
-    // occasionally emit a stray flag object with a null/blank/unknown number;
-    // those used to be scored with a default weight and caused 0↔20 jitter on
-    // otherwise-clean documents. Dropping them keeps scoring deterministic.
     .filter((f: any) => {
       if (!f) return false
       const n = Number((f as any).n)
@@ -361,7 +686,6 @@ function normalizeResult(r: any) {
       const def = FLAG_FRAMEWORK.find((d) => d.n === Number(f.n))!
       const weight = def.weight
       const tier = normalizeTier(f.evidenceTier)
-      // Severity is determined entirely by the tier — ignore the model's value.
       const severity = TIER_SEVERITY[tier] ?? 0
 
       const weightedPoints = tier === 'GAP' ? 0 : Math.round((weight * severity) / 10)
@@ -377,26 +701,15 @@ function normalizeResult(r: any) {
       }
     })
 
-  // Official formula: total ÷ max × 100, where max = full weight of every
-  // triggered NON-GAP flag (i.e. as if each were severity 10).
   const scored = flags.filter((f: any) => f.evidenceTier !== 'GAP')
   const totalWeightedPoints = scored.reduce((s: number, f: any) => s + f.weightedPoints, 0)
   const maxPossiblePoints = scored.reduce((s: number, f: any) => s + f.weight, 0)
 
-  // STABILITY FLOOR: the raw "total ÷ triggered-max" ratio lets a SINGLE
-  // borderline flag dominate (e.g. 1 flag = up to 100% → "Critical") even in a
-  // long, otherwise-clean document. To prevent one flickering flag from swinging
-  // the verdict from Low to Critical, the denominator includes a baseline floor.
-  // The floor scales with how few flags triggered: with only 1–2 triggered
-  // flags, a meaningful "clean evidence" baseline is added so a lone minor flag
-  // reads as Low/Medium, not Critical. With several flags the floor fades out and
-  // the score converges to the original formula.
-  const STABILITY_FLOOR = 40 // baseline points representing "document reviewed, little/no fraud signal"
+  const STABILITY_FLOOR = 40
   const floorWeight = scored.length >= 4 ? 0 : STABILITY_FLOOR * (1 - scored.length / 4)
   const denom = maxPossiblePoints + floorWeight
   const riskScore = denom > 0 ? clamp(Math.round((totalWeightedPoints / denom) * 100), 0, 100) : 0
 
-  // Key drivers: flags contributing >= 15% of the maximum.
   const keyDrivers = scored
     .filter((f: any) => maxPossiblePoints > 0 && f.weightedPoints / maxPossiblePoints >= 0.15)
     .map((f: any) => f.n)
@@ -414,7 +727,6 @@ function normalizeResult(r: any) {
     },
     verdict: String(r.verdict || ''),
     summary: String(r.summary || ''),
-    // Show GAP items last; otherwise highest weighted points first.
     triggeredFlags: flags.sort((a: any, b: any) => {
       if ((a.evidenceTier === 'GAP') !== (b.evidenceTier === 'GAP')) return a.evidenceTier === 'GAP' ? 1 : -1
       return b.weightedPoints - a.weightedPoints

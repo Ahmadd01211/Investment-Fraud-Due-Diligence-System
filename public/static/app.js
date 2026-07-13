@@ -129,7 +129,7 @@
     const t = String(text || '').trim();
     if (!t) return false;
     const prefix = material.value.trim() ? material.value.trimEnd() + '\n\n' : '';
-    material.value = (prefix + (label ? `--- ${label} ---\n` : '') + t).slice(0, 150000);
+    material.value = prefix + (label ? `--- ${label} ---\n` : '') + t;
     updateCount();
     return true;
   }
