@@ -10,33 +10,75 @@
 //    • text-only, short doc     → TEXT model  (fast, cheap)
 //    • text-only, long doc      → LARGE model (higher capability)
 //  CHUNKING (large text-only docs):
-//    • Document is split into sequential chunks. Each chunk is prepended with a
-//      ~5000-token (~20k char) CARRYOVER of the previous chunk's tail so context
-//      flows across boundaries. Chunks run SEQUENTIALLY (order preserved).
+//    • Document is split into sequential chunks sized as a PERCENT of the doc
+//      (default 25% → ~4 chunks), clamped to [MIN, MAX] chars. Each chunk is
+//      prepended with a CARRYOVER (default 10% of chunk size) of the prior text
+//      so context flows across boundaries. Chunks run SEQUENTIALLY.
 //    • Results merge by taking the HIGHEST evidence tier per flag across chunks —
 //      deterministic AND monotonic (more text never lowers the score).
+//
+//  PROVIDERS & FALLBACK:
+//    • OpenAI (gpt-4.1 text / gpt-5.4 vision) and Kimi (kimi-k2.6, ~250K ctx).
+//    • A provider is "available" only if its API key is set. If the preferred
+//      provider is missing OR fails at runtime (quota/auth/5xx), we automatically
+//      fall back to the other one.
 // ════════════════════════════════════════════════════════════════
 
 export type Bindings = {
-  OPENAI_API_KEY: string
-  OPENAI_BASE_URL: string
+  // ── OpenAI provider ──
+  OPENAI_API_KEY?: string
+  OPENAI_BASE_URL?: string
   /** Optional: force ONE model for everything (overrides text/vision split). */
   OPENAI_MODEL?: string
-  /** Optional: model for text-only submissions (default gpt-4o-mini, cheap). */
+  /** Optional: model for text-only submissions (default gpt-4.1). */
   OPENAI_TEXT_MODEL?: string
-  /** Optional: model for submissions WITH images (default gpt-4o, sharp vision). */
+  /** Optional: model for submissions WITH images (default gpt-5.4, sharp vision). */
   OPENAI_VISION_MODEL?: string
   /** Optional: reasoning effort for GPT-5/o models (none|low|medium|high). Default low for consistency. */
   OPENAI_REASONING_EFFORT?: string
-  /** Optional: high-capability model for large/complex documents (default gpt-5.5). */
+  /** Optional: high-capability model for large/complex documents (default = text model). */
   OPENAI_LARGE_MODEL?: string
-  /** Optional: char threshold above which the large model is used (default 40000). */
+  /** Optional: char threshold above which the large model is used (default = never). */
   OPENAI_LARGE_DOC_CHARS?: string
-  /** Optional: max characters of material sent to the model PER CHUNK (default 100000). */
+
+  // ── Kimi (Moonshot AI) provider — ~250K context, multimodal ──
+  /** Optional: Moonshot / Kimi API key. Enables Kimi as a provider + fallback. */
+  KIMI_API_KEY?: string
+  /** Optional: Kimi base URL (default https://api.moonshot.ai/v1). */
+  KIMI_BASE_URL?: string
+  /** Optional: Kimi model (default kimi-k2.6, ~262K context, multimodal). */
+  KIMI_MODEL?: string
+
+  // ── Provider preference & fallback ──
+  /** Optional: preferred provider for text 'openai' | 'kimi' (default openai). Fallback to the other on failure. */
+  PREFERRED_PROVIDER?: string
+  /** Optional: char threshold above which we prefer Kimi single-shot (default 100000). */
+  KIMI_PREFER_DOC_CHARS?: string
+
+  // ── Generalized, percentage-based chunking (all optional) ──
+  /** Target chunk size as a PERCENT of the document (default 25 → ~4 chunks). */
+  CHUNK_PERCENT?: string
+  /** Carryover context as a PERCENT of chunk size (default 10). */
+  CARRYOVER_PERCENT?: string
+  /** Hard max chars per chunk, model-safety cap (default 100000). */
+  MAX_CHUNK_CHARS?: string
+  /** Min chars per chunk, so tiny docs aren't over-split (default 20000). */
+  MIN_CHUNK_CHARS?: string
+  /** Legacy alias for MAX_CHUNK_CHARS. */
   OPENAI_MAX_MATERIAL_CHARS?: string
-  /** Optional: carryover context chars kept from prior chunks (default 20000 ≈ 5000 tokens). */
+  /** Legacy alias for a fixed carryover char count (overrides CARRYOVER_PERCENT if set). */
   OPENAI_CHUNK_CONTEXT_CHARS?: string
 }
+
+// ── Provider defaults ──
+const DEFAULT_OPENAI_TEXT_MODEL = 'gpt-4.1'
+const DEFAULT_OPENAI_VISION_MODEL = 'gpt-5.4'
+const DEFAULT_KIMI_MODEL = 'kimi-k2.6'
+const DEFAULT_KIMI_BASE_URL = 'https://api.moonshot.ai/v1'
+const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1'
+// Kimi context is ~262,144 tokens; cap material well under that (leave room for
+// system prompt + JSON output). ~600K chars ≈ ~180K tokens of material.
+const KIMI_MATERIAL_CAP = 600000
 
 // The 21-flag framework (weight = max points each flag can contribute)
 export const FLAG_FRAMEWORK = [
@@ -167,10 +209,37 @@ export interface AnalyzeInput {
 //  CHUNKING CONFIGURATION
 // ════════════════════════════════════════════════════════════════
 
-const CHUNK_SIZE = 100000        // chars per chunk (~25k tokens for GPT-4 class)
-const CHUNK_OVERLAP = 500        // tiny raw overlap; real continuity comes from CHUNK_CONTEXT_CHARS carryover
-const CHUNK_CONTEXT_CHARS = 20000 // ~5000 tokens of carryover from prior chunks (prepended to each chunk)
-const MAX_CHUNKS = 40            // safety ceiling on number of chunks
+// ── Percentage-based chunking defaults (generalized to any doc size) ──
+const DEFAULT_CHUNK_PERCENT = 25   // aim for ~4 chunks (25% each) by default
+const DEFAULT_CARRYOVER_PERCENT = 10 // carryover = 10% of chunk size
+const DEFAULT_MAX_CHUNK_CHARS = 100000 // model-safety cap per chunk
+const DEFAULT_MIN_CHUNK_CHARS = 20000  // don't over-split small docs
+const CHUNK_OVERLAP = 500          // tiny raw overlap; real continuity comes from carryover
+const MAX_CHUNKS = 40              // safety ceiling on number of chunks
+
+/**
+ * Decide the effective chunk size (chars) and carryover (chars) for a document,
+ * expressed as PERCENTAGES of the doc / chunk, then clamped to safe bounds.
+ * This generalizes: a 40K doc stays one chunk; a 2M doc splits into many.
+ */
+function computeChunkPlan(env: Bindings, docLen: number) {
+  const chunkPct = clamp(Number(env.CHUNK_PERCENT) || DEFAULT_CHUNK_PERCENT, 5, 100)
+  const carryPct = clamp(Number(env.CARRYOVER_PERCENT) || DEFAULT_CARRYOVER_PERCENT, 0, 50)
+  const maxChunk = Number(env.MAX_CHUNK_CHARS) || Number(env.OPENAI_MAX_MATERIAL_CHARS) || DEFAULT_MAX_CHUNK_CHARS
+  const minChunk = Number(env.MIN_CHUNK_CHARS) || DEFAULT_MIN_CHUNK_CHARS
+
+  // Target size = chunkPct% of the document, clamped between [minChunk, maxChunk].
+  let chunkSize = Math.round((docLen * chunkPct) / 100)
+  chunkSize = clamp(chunkSize, Math.min(minChunk, maxChunk), maxChunk)
+
+  // Carryover = carryPct% of the chunk size, but never larger than a fixed
+  // legacy override if the operator set one.
+  let carryover =
+    Number(env.OPENAI_CHUNK_CONTEXT_CHARS) || Math.round((chunkSize * carryPct) / 100)
+  carryover = clamp(carryover, 0, Math.floor(chunkSize * 0.5))
+
+  return { chunkSize, carryover, maxChunk, minChunk, chunkPct, carryPct }
+}
 
 // Tier ranking for merge (higher number = higher tier)
 const TIER_RANK: Record<string, number> = {
@@ -243,7 +312,7 @@ interface ApiConfig {
 }
 
 async function callLlmApi(config: ApiConfig, systemPrompt: string, userContent: any, images: string[]) {
-  const isReasoning = /^(gpt-5|o1|o3|o4)/i.test(config.model)
+  const isReasoning = /^(gpt-5|o1|o3|o4|kimi)/i.test(config.model)
   const reqBody: any = {
     model: config.model,
     messages: [
@@ -291,13 +360,143 @@ async function callLlmApi(config: ApiConfig, systemPrompt: string, userContent: 
 
 function handleApiError(resp: Response, txt: string): never {
   const low = txt.toLowerCase()
-  if (resp.status === 429 || low.includes('insufficient_quota') || low.includes('exceeded your current quota') || low.includes('billing')) {
+  if (resp.status === 429 || low.includes('insufficient_quota') || low.includes('exceeded your current quota') || low.includes('billing') || low.includes('insufficient balance')) {
     throw new Error('SERVICE_QUOTA: The analysis service is temporarily unavailable (API quota/billing limit reached).')
   }
   if (resp.status === 401 || resp.status === 403) {
     throw new Error('SERVICE_AUTH: The analysis service is misconfigured (invalid API key).')
   }
   throw new Error(`Analysis service error (${resp.status}). ${txt.slice(0, 200)}`)
+}
+
+// ════════════════════════════════════════════════════════════════
+//  PROVIDERS & FALLBACK
+// ════════════════════════════════════════════════════════════════
+
+type ProviderName = 'openai' | 'kimi'
+
+interface Provider {
+  name: ProviderName
+  apiKey: string
+  baseUrl: string
+  /** Pick the model for this provider given whether images are present. */
+  model: (hasImages: boolean) => string
+  /** True if this provider can accept images (vision). */
+  multimodal: boolean
+  reasoningEffort?: string
+}
+
+/** Build the list of AVAILABLE providers (those with an API key set). */
+function buildProviders(env: Bindings): Provider[] {
+  const providers: Provider[] = []
+
+  if (env.OPENAI_API_KEY) {
+    const textModel = env.OPENAI_TEXT_MODEL || DEFAULT_OPENAI_TEXT_MODEL
+    const visionModel = env.OPENAI_VISION_MODEL || DEFAULT_OPENAI_VISION_MODEL
+    providers.push({
+      name: 'openai',
+      apiKey: env.OPENAI_API_KEY,
+      baseUrl: (env.OPENAI_BASE_URL || DEFAULT_OPENAI_BASE_URL).replace(/\/$/, ''),
+      model: (hasImages) => env.OPENAI_MODEL || (hasImages ? visionModel : textModel),
+      multimodal: true, // gpt-5.4 vision path
+      reasoningEffort: env.OPENAI_REASONING_EFFORT,
+    })
+  }
+
+  if (env.KIMI_API_KEY) {
+    const kimiModel = env.KIMI_MODEL || DEFAULT_KIMI_MODEL
+    providers.push({
+      name: 'kimi',
+      apiKey: env.KIMI_API_KEY,
+      baseUrl: (env.KIMI_BASE_URL || DEFAULT_KIMI_BASE_URL).replace(/\/$/, ''),
+      model: () => kimiModel, // kimi-k2.6 handles both text and images
+      multimodal: true,
+      reasoningEffort: env.OPENAI_REASONING_EFFORT,
+    })
+  }
+
+  return providers
+}
+
+/** Order providers by preference for THIS request (routing + fallback order). */
+function orderProviders(
+  providers: Provider[],
+  opts: { hasImages: boolean; docLen: number; preferKimiLarge: boolean; preferred: ProviderName }
+): Provider[] {
+  const withKey = [...providers]
+  // If images present, providers that are multimodal go first.
+  withKey.sort((a, b) => {
+    // 1) multimodal priority when images
+    if (opts.hasImages) {
+      const am = a.multimodal ? 0 : 1
+      const bm = b.multimodal ? 0 : 1
+      if (am !== bm) return am - bm
+    }
+    // 2) for very large TEXT docs, prefer Kimi (single-shot 250K ctx)
+    if (!opts.hasImages && opts.preferKimiLarge) {
+      const ak = a.name === 'kimi' ? 0 : 1
+      const bk = b.name === 'kimi' ? 0 : 1
+      if (ak !== bk) return ak - bk
+    }
+    // 3) otherwise honor the configured preferred provider
+    const ap = a.name === opts.preferred ? 0 : 1
+    const bp = b.name === opts.preferred ? 0 : 1
+    return ap - bp
+  })
+  return withKey
+}
+
+function providerToConfig(p: Provider, hasImages: boolean): ApiConfig {
+  return { apiKey: p.apiKey, baseUrl: p.baseUrl, model: p.model(hasImages), reasoningEffort: p.reasoningEffort }
+}
+
+/** Errors that justify trying the OTHER provider. */
+function isFallbackWorthy(err: any): boolean {
+  const m = String(err?.message || '')
+  return (
+    m.startsWith('SERVICE_QUOTA:') ||
+    m.startsWith('SERVICE_AUTH:') ||
+    m.startsWith('SERVICE_MESSAGE:') ||
+    m.startsWith('Analysis service error (5') || // 5xx
+    m.includes('Analysis service returned an empty response')
+  )
+}
+
+/**
+ * Make ONE model call, trying each provider in order until one succeeds.
+ * Returns the parsed JSON result. Throws the last error if all providers fail.
+ */
+async function callParsedWithFallback(
+  ordered: Provider[],
+  hasImages: boolean,
+  systemPrompt: string,
+  userContent: any,
+  images: string[]
+): Promise<any> {
+  let lastErr: any
+  for (const p of ordered) {
+    const config = providerToConfig(p, hasImages)
+    try {
+      const resp = await callLlmApi(config, systemPrompt, userContent, images)
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => '')
+        handleApiError(resp, txt)
+      }
+      const data: any = await resp.json()
+      const content = data?.choices?.[0]?.message?.content
+      const finish = data?.choices?.[0]?.finish_reason
+      if (!content) throw new Error('Analysis service returned an empty response.')
+      return parseResponse(content, finish)
+    } catch (err) {
+      lastErr = err
+      // Not-relevant / truncation are NOT provider problems — don't fall back.
+      const msg = String((err as any)?.message || '')
+      if (msg.startsWith('NOT_RELEVANT:') || msg.startsWith('RESPONSE_TRUNCATED:')) throw err
+      if (!isFallbackWorthy(err)) throw err
+      // else: loop to next provider
+    }
+  }
+  throw lastErr || new Error('All analysis providers are unavailable.')
 }
 
 function parseResponse(content: string, finishReason: string | null): any {
@@ -337,14 +536,13 @@ function parseResponse(content: string, finishReason: string | null): any {
 // ════════════════════════════════════════════════════════════════
 
 async function analyzeOneChunk(
-  env: Bindings,
-  config: ApiConfig,
+  ordered: Provider[],
   ctx: string[],
   material: string,
   images: string[],
   chunkIndex: number,
   totalChunks: number,
-  /** ~5000-token tail of the PREVIOUS chunk(s), for cross-boundary context. */
+  /** carryover tail of the PREVIOUS chunk(s), for cross-boundary context. */
   carryover: string = ''
 ): Promise<any> {
   const textPart =
@@ -366,23 +564,12 @@ async function analyzeOneChunk(
       : '') +
     `Analyze using the 21-flag framework and return the JSON object only.`
 
-  const userContent = images.length > 0
+  const hasImages = images.length > 0
+  const userContent = hasImages
     ? [{ type: 'text', text: textPart }, ...images.map((url: string) => ({ type: 'image_url', image_url: { url } }))]
     : textPart
 
-  const resp = await callLlmApi(config, SYSTEM_PROMPT, userContent, images)
-
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => '')
-    handleApiError(resp, txt)
-  }
-
-  const data: any = await resp.json()
-  const content = data?.choices?.[0]?.message?.content
-  const finish = data?.choices?.[0]?.finish_reason
-
-  if (!content) throw new Error('Analysis service returned an empty response.')
-  return parseResponse(content, finish)
+  return callParsedWithFallback(ordered, hasImages, SYSTEM_PROMPT, userContent, images)
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -493,11 +680,10 @@ function mergeChunkResults(results: any[]): any {
 // ════════════════════════════════════════════════════════════════
 
 export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
-  const apiKey = env.OPENAI_API_KEY
-  const baseUrl = (env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '')
-
-  if (!apiKey) {
-    throw new Error('Analysis service is not configured. (Missing server API key.)')
+  // ── Build available providers (each needs its own key) ──
+  const providers = buildProviders(env)
+  if (providers.length === 0) {
+    throw new Error('Analysis service is not configured. (Set OPENAI_API_KEY and/or KIMI_API_KEY.)')
   }
 
   const ctx: string[] = []
@@ -509,37 +695,52 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
 
   const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 4)
   const hasImages = images.length > 0
-
   const rawMaterial = (input.material || '').trim()
 
-  // ── MODEL SELECTION (OpenAI-only) ──
-  // One API call uses ONE model. Selection rule:
-  //   • any image attached  → VISION model (image + text analyzed together, single prompt)
-  //   • text-only, short doc → TEXT model  (fast, cheap)
-  //   • text-only, long doc  → LARGE model (higher capability), and doc is chunked
-  const textModel = env.OPENAI_TEXT_MODEL || 'gpt-5.4-mini'
-  const visionModel = env.OPENAI_VISION_MODEL || 'gpt-5.4'
-  const largeModel = env.OPENAI_LARGE_MODEL || textModel
+  // ── Provider preference + routing ──
+  const preferred: ProviderName = (env.PREFERRED_PROVIDER === 'kimi' ? 'kimi' : 'openai')
+  const kimiAvailable = providers.some((p) => p.name === 'kimi')
+  const KIMI_PREFER_DOC_CHARS = Number(env.KIMI_PREFER_DOC_CHARS) || 100000
 
-  const MAX_MATERIAL = Number(env.OPENAI_MAX_MATERIAL_CHARS) || CHUNK_SIZE
-  const CARRYOVER = Number(env.OPENAI_CHUNK_CONTEXT_CHARS) || CHUNK_CONTEXT_CHARS
-  const LARGE_DOC_CHARS = Number(env.OPENAI_LARGE_DOC_CHARS) || Number.MAX_SAFE_INTEGER
-  const isLongDoc = rawMaterial.length >= LARGE_DOC_CHARS || rawMaterial.length > MAX_MATERIAL
+  // For very large TEXT docs, prefer Kimi single-shot (250K ctx) if we can fit
+  // the whole doc under Kimi's material cap — avoids many sequential chunks.
+  const fitsKimiSingleShot = rawMaterial.length <= KIMI_MATERIAL_CAP
+  const preferKimiLarge =
+    !hasImages && kimiAvailable && fitsKimiSingleShot && rawMaterial.length >= KIMI_PREFER_DOC_CHARS
+
+  // ── Percentage-based chunk plan (generalized to any size) ──
+  const plan = computeChunkPlan(env, rawMaterial.length)
+
+  // A single call can hold the whole doc if:
+  //   • it fits one OpenAI chunk (<= plan.maxChunk), OR
+  //   • we're routing to Kimi single-shot for a large text doc.
+  const singleShot =
+    hasImages ||
+    rawMaterial.length <= plan.maxChunk ||
+    preferKimiLarge
 
   let results: any[]
 
-  if (rawMaterial.length <= MAX_MATERIAL) {
-    // ── SINGLE SHOT: whole doc fits in one call ──
-    // Image → vision model; else long → large model; else → text model.
-    const model = env.OPENAI_MODEL || (hasImages ? visionModel : isLongDoc ? largeModel : textModel)
+  if (singleShot) {
+    // ── SINGLE SHOT (image OR small doc OR Kimi-large-text) ──
+    // Order providers so the right one is primary; the other is the fallback.
+    const ordered = orderProviders(providers, {
+      hasImages,
+      docLen: rawMaterial.length,
+      preferKimiLarge,
+      preferred,
+    })
 
-    const config: ApiConfig = { apiKey, baseUrl, model, reasoningEffort: env.OPENAI_REASONING_EFFORT }
+    // If routing to Kimi for a huge doc, cap material to Kimi's safe window;
+    // otherwise send the full doc (it already fits an OpenAI chunk, or has images).
+    const cap = preferKimiLarge ? KIMI_MATERIAL_CAP : Math.max(plan.maxChunk, rawMaterial.length)
+    const material = rawMaterial.slice(0, cap)
+    const wasTruncated = rawMaterial.length > cap
 
-    const material = rawMaterial
     const textPart =
       (ctx.length ? `INVESTOR-PROVIDED CONTEXT:\n${ctx.join('\n')}\n\n` : '') +
       (material.trim().length
-        ? `SUBMITTED MATERIAL (text) TO ANALYZE:\n"""\n${material}\n"""\n\n`
+        ? `SUBMITTED MATERIAL (text) TO ANALYZE${wasTruncated ? ' (very long document — analyze the full body provided)' : ''}:\n"""\n${material}\n"""\n\n`
         : '') +
       (hasImages
         ? `The investor also attached ${images.length} image(s) (e.g. a screenshot of an ad, email, or pitch-deck page). Read ALL text and visual claims in the image(s) and treat them as submitted material.\n\n`
@@ -551,45 +752,36 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
       ? [{ type: 'text', text: textPart }, ...images.map((url) => ({ type: 'image_url', image_url: { url } }))]
       : textPart
 
-    const resp = await callLlmApi(config, SYSTEM_PROMPT, userContent, images)
-    if (!resp.ok) {
-      const txt = await resp.text().catch(() => '')
-      handleApiError(resp, txt)
-    }
-    const data: any = await resp.json()
-    const content = data?.choices?.[0]?.message?.content
-    const finish = data?.choices?.[0]?.finish_reason
-    if (!content) throw new Error('Analysis service returned an empty response.')
-
-    results = [parseResponse(content, finish)]
+    results = [await callParsedWithFallback(ordered, hasImages, SYSTEM_PROMPT, userContent, images)]
 
   } else {
-    // ── LARGE TEXT DOC: SEQUENTIAL CHUNKING WITH ~5000-TOKEN CARRYOVER ──
-    // Chunks are analyzed in order. Each chunk is prepended with the tail
-    // (~CARRYOVER chars ≈ 5000 tokens) of the accumulated prior text so that
-    // context flows across boundaries. If images are also attached, they ride
-    // on the FIRST chunk and that chunk uses the vision model.
-    const chunks = splitIntoChunks(rawMaterial, MAX_MATERIAL, CHUNK_OVERLAP)
-    const chunkModel = env.OPENAI_MODEL || largeModel
+    // ── LARGE TEXT DOC: SEQUENTIAL CHUNKING WITH % CARRYOVER ──
+    // Chunk size and carryover both come from the percentage-based plan.
+    const chunks = splitIntoChunks(rawMaterial, plan.chunkSize, CHUNK_OVERLAP)
 
-    const baseConfig: ApiConfig = {
-      apiKey,
-      baseUrl,
-      model: chunkModel,
-      reasoningEffort: env.OPENAI_REASONING_EFFORT,
-    }
+    // Order providers once for text chunks (no images on most chunks).
+    const orderedText = orderProviders(providers, {
+      hasImages: false,
+      docLen: rawMaterial.length,
+      preferKimiLarge: false, // chunking path is OpenAI-style; Kimi still usable as fallback
+      preferred,
+    })
+    const orderedImg = orderProviders(providers, {
+      hasImages: true,
+      docLen: rawMaterial.length,
+      preferKimiLarge: false,
+      preferred,
+    })
 
     results = []
     let carryover = ''
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i]
       const chunkHasImages = i === 0 && hasImages
-      // First chunk with images must use the vision model so the image is read.
-      const cfg: ApiConfig = chunkHasImages ? { ...baseConfig, model: env.OPENAI_MODEL || visionModel } : baseConfig
+      const ordered = chunkHasImages ? orderedImg : orderedText
 
       const res = await analyzeOneChunk(
-        env,
-        cfg,
+        ordered,
         ctx,
         chunk,
         chunkHasImages ? images : [],
@@ -599,10 +791,9 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
       )
       results.push(res)
 
-      // Build carryover for the NEXT chunk: keep the last ~CARRYOVER chars of
-      // the text seen so far (previous carryover tail + this chunk's tail).
+      // Carryover for the NEXT chunk = last plan.carryover chars seen so far.
       const combined = (carryover + '\n' + chunk)
-      carryover = combined.slice(-CARRYOVER)
+      carryover = plan.carryover > 0 ? combined.slice(-plan.carryover) : ''
     }
   }
 
