@@ -33,6 +33,18 @@ managed API key, so users never have to bring their own.
 - **Explainable score breakdown** — an expandable table showing Flag # | Name | Weight | Severity |
   Evidence Tier | Weighted Points, the exact calculation, and the key score drivers.
 
+### Document Size: Unlimited (Chunk-and-Merge v2.0)
+- **No size limits** — upload documents of any length. The backend handles large documents via:
+  - **Kimi 2.6** (2M token context window) — when configured with a `KIMI_API_KEY`, large documents
+    are sent directly to Kimi without chunking, producing a single coherent analysis.
+  - **Chunk-and-Merge** — documents exceeding the per-chunk threshold are split into overlapping
+    chunks (~100k chars each, with ~5k overlap), analyzed in parallel, and merged by taking the
+    **highest evidence tier** per flag across all chunks. This is **monotonically deterministic** —
+    more text can only increase or maintain the score, never lower it.
+- **Deterministic scoring** — the server re-computes the score authoritatively using the tier-based
+  severity table, so the same document always produces the same score regardless of how many
+  chunks it required.
+
 ### Official Scoring Methodology (matches the original IIE engine)
 - Each triggered flag gets a **severity (1–10)** and an **Evidence Tier**:
   - **Tier 1** – primary-source proof · **Tier 2** – the promoter's own quoted language ·
@@ -92,6 +104,7 @@ managed API key, so users never have to bring their own.
 - Click **Take photo** (mobile) to snap a pitch / ad and have it analyzed directly.
 - **Paste** a screenshot from your clipboard into the box — it attaches as an image.
 - An image-only submission is fine — you don't have to type anything if you've attached a picture.
+- **No file size limits** — the backend handles large documents via chunking or Kimi 2.6.
 - *Note:* scanned PDFs with no selectable text won't extract — attach a screenshot of the page
   instead so the vision model can read it.
 
@@ -104,12 +117,19 @@ managed API key, so users never have to bring their own.
 ## Local Development
 ```bash
 npm run build                       # build to dist/
-pm2 start ecosystem.config.cjs      # serve via wrangler pages dev on :3000
+pm run dev:sandbox                  # serve via wrangler pages dev on :3000
+# or
+pm2 start ecosystem.config.cjs       # serve via PM2 (recommended)
 curl http://localhost:3000          # smoke test
 ```
-### Backend AI key (NO BYOK — you provide ONE key for all users)
+
+### Backend AI configuration (NO BYOK — you provide ONE key for all users)
+
+The app supports **two AI providers**: OpenAI-compatible (default) and **Kimi 2.6** (for large documents).
+
+#### OpenAI-compatible provider
 The app calls any **OpenAI-compatible** Chat Completions API. Configure it once on the
-backend; end users never enter a key. Three env vars control it:
+backend; end users never enter a key.
 
 | Var | Purpose | Default |
 |-----|---------|---------|
@@ -118,6 +138,8 @@ backend; end users never enter a key. Three env vars control it:
 | `OPENAI_TEXT_MODEL` | model for text-only submissions (cheap) | `gpt-5.4-mini` |
 | `OPENAI_VISION_MODEL` | model for submissions **with images** (sharp vision) | `gpt-5.4` |
 | `OPENAI_MODEL` | optional — force ONE model for everything (overrides the split) | _(unset)_ |
+| `OPENAI_MAX_MATERIAL_CHARS` | max chars per chunk (default 100k) | `100000` |
+| `OPENAI_REASONING_EFFORT` | `none`/`low`/`medium`/`high` — default `low` for consistency | `low` |
 
 **Smart model routing:** when the user attaches an image/screenshot the app uses
 `OPENAI_VISION_MODEL` (default `gpt-5.4`, sharper vision); plain-text submissions use
@@ -125,25 +147,79 @@ the cheaper `OPENAI_TEXT_MODEL` (`gpt-5.4-mini`). Set `OPENAI_MODEL` to force on
 The code auto-selects `max_completion_tokens` for GPT-5/o-series models and
 `max_tokens` for older models (gpt-4o).
 
+#### Kimi 2.6 provider (optional, for large documents)
+Kimi 2.6 has a **2M token context window** (~8M characters), so large documents can be
+sent in a single shot without chunking. When configured, documents exceeding the threshold
+auto-route to Kimi for a single coherent analysis.
+
+| Var | Purpose | Default |
+|-----|---------|---------|
+| `KIMI_API_KEY` | Moonshot AI / Kimi API key | _(unset — Kimi disabled)_ |
+| `KIMI_BASE_URL` | Kimi API base | `https://api.moonshot.cn/v1` |
+| `KIMI_MODEL` | Kimi model name | `kimi-2.6` |
+| `KIMI_DOC_CHARS` | char threshold to route to Kimi | `150000` |
+
+**Routing priority:** If `KIMI_API_KEY` is set and the document exceeds `KIMI_DOC_CHARS`,
+the document goes to Kimi 2.6 in a single call. Otherwise, standard chunking or single-shot
+with the OpenAI-compatible provider is used.
+
 For local dev, put them in `.dev.vars` (git-ignored):
 ```
+# OpenAI-compatible (required)
 OPENAI_API_KEY=sk-your-openai-key
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_TEXT_MODEL=gpt-5.4-mini
 OPENAI_VISION_MODEL=gpt-5.4
+
+# Kimi 2.6 (optional — enables large-doc single-shot)
+KIMI_API_KEY=sk-your-kimi-key
+KIMI_BASE_URL=https://api.moonshot.cn/v1
+KIMI_MODEL=kimi-2.6
+KIMI_DOC_CHARS=150000
 ```
-Works with OpenAI, OpenRouter, Together, Groq, Azure OpenAI, etc. — just set the
-matching `OPENAI_BASE_URL` and `OPENAI_MODEL`.
+
+Works with OpenAI, OpenRouter, Together, Groq, Azure OpenAI, Kimi, etc. — just set the
+matching `OPENAI_BASE_URL` and `OPENAI_MODEL` (or `KIMI_BASE_URL` for Kimi).
+
+## How Chunk-and-Merge Works (for large documents)
+
+When a document exceeds the per-chunk threshold (~100k chars by default):
+
+1. **Split** — The document is split into overlapping chunks (~100k chars each, with ~5k overlap
+   to preserve context at boundaries). The split tries to break at sentence boundaries to keep
+   context intact.
+
+2. **Analyze in parallel** — Each chunk is sent to the AI model independently with the same
+   21-flag system prompt. Chunks are processed in parallel for speed.
+
+3. **Merge** — For each of the 21 flags, the **highest evidence tier** found across all chunks
+   is kept. This is **monotonic**: more text can only increase or maintain the score, never lower it.
+
+4. **Re-compute score** — The server re-computes the risk score authoritatively using the
+   `TIER_SEVERITY` table (server-side, deterministic), so the final score is always consistent.
+
+**Why this keeps scores stable:**
+- Severity is fixed by tier (not chosen by the model) — server-side `TIER_SEVERITY` table.
+- Merge is monotonic: higher tier always wins → same document always produces same or higher score.
+- The stability floor still applies (1–2 flags get a baseline floor to prevent one borderline flag
+  from swinging a clean document to Critical).
 
 ## Deployment (Cloudflare Pages)
-The backend key is a **secret** in production (do not commit it):
+The backend keys are **secrets** in production (do not commit them):
+
 ```bash
 # one-time
 npx wrangler pages project create investsafe-pro --production-branch main
+
+# OpenAI-compatible secrets
 npx wrangler pages secret put OPENAI_API_KEY --project-name investsafe-pro
 npx wrangler pages secret put OPENAI_BASE_URL --project-name investsafe-pro
 npx wrangler pages secret put OPENAI_TEXT_MODEL --project-name investsafe-pro
 npx wrangler pages secret put OPENAI_VISION_MODEL --project-name investsafe-pro
+
+# Optional Kimi 2.6 secrets
+npx wrangler pages secret put KIMI_API_KEY --project-name investsafe-pro
+npx wrangler pages secret put KIMI_BASE_URL --project-name investsafe-pro
 
 # deploy
 npm run deploy
@@ -153,7 +229,7 @@ npm run deploy
 - **Platform**: Cloudflare Pages
 - **Status**: ✅ Running locally in sandbox (PM2) · ⏳ Not yet deployed to production
 - **Project name**: `investsafe-pro`
-- **Last Updated**: 2026-06-30 — stable scoring for large docs: send up to 120k chars (no more tiny opening-slice), `reasoning_effort: low` to curb reasoning-model variance, and a stability floor so a single borderline flag can't swing a long clean document from Low to Critical. Verified: 707 Franklin PPM = Low (8/8 runs); fraud pitch = 78/Critical (every run)
+- **Last Updated**: 2026-07-13 — v2.0: Chunk-and-Merge for unlimited document size, Kimi 2.6 support (2M context window), monotonic deterministic merge, removed frontend 150k char cap. Score stability preserved via server-side TIER_SEVERITY table.
 
 ## Not Yet Implemented / Next Steps
 - Live SEC EDGAR / FINRA BrokerCheck lookups (currently the report tells users *where* to verify).
