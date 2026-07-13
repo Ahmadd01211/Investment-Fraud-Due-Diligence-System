@@ -3,13 +3,18 @@
 //  Uses our managed OpenAI key. No BYOK. Built on the documented
 //  Barry Minkow investigative methodology (21-flag framework).
 //
-//  v2.0 — Chunk-and-Merge for unlimited document size + Kimi (kimi-k2.6) support
+//  v3.0 — OpenAI-only. Model-by-length + sequential chunking with carryover.
 //  ──
-//  Large documents are split into overlapping chunks, analyzed in parallel,
-//  then merged by taking the HIGHEST evidence tier per flag across all chunks.
-//  This makes scoring deterministic AND monotonic (more text never lowers score).
-//  Kimi (kimi-k2.6, ~256K-token context) is used when available for large docs,
-//  handling them in a single shot up to ~600K chars before falling back to chunking.
+//  MODEL SELECTION (single call, one model):
+//    • any image attached      → VISION model (image + text analyzed together in ONE prompt)
+//    • text-only, short doc     → TEXT model  (fast, cheap)
+//    • text-only, long doc      → LARGE model (higher capability)
+//  CHUNKING (large text-only docs):
+//    • Document is split into sequential chunks. Each chunk is prepended with a
+//      ~5000-token (~20k char) CARRYOVER of the previous chunk's tail so context
+//      flows across boundaries. Chunks run SEQUENTIALLY (order preserved).
+//    • Results merge by taking the HIGHEST evidence tier per flag across chunks —
+//      deterministic AND monotonic (more text never lowers the score).
 // ════════════════════════════════════════════════════════════════
 
 export type Bindings = {
@@ -29,16 +34,8 @@ export type Bindings = {
   OPENAI_LARGE_DOC_CHARS?: string
   /** Optional: max characters of material sent to the model PER CHUNK (default 100000). */
   OPENAI_MAX_MATERIAL_CHARS?: string
-
-  // ── Kimi 2.6 support ──
-  /** Optional: Moonshot AI / Kimi API key. If set, large docs route here. */
-  KIMI_API_KEY?: string
-  /** Optional: Kimi API base URL (default https://api.moonshot.ai/v1). */
-  KIMI_BASE_URL?: string
-  /** Optional: Kimi model name (default kimi-k2.6). */
-  KIMI_MODEL?: string
-  /** Optional: char threshold above which Kimi is used instead of chunking (default 150000). */
-  KIMI_DOC_CHARS?: string
+  /** Optional: carryover context chars kept from prior chunks (default 20000 ≈ 5000 tokens). */
+  OPENAI_CHUNK_CONTEXT_CHARS?: string
 }
 
 // The 21-flag framework (weight = max points each flag can contribute)
@@ -170,9 +167,10 @@ export interface AnalyzeInput {
 //  CHUNKING CONFIGURATION
 // ════════════════════════════════════════════════════════════════
 
-const CHUNK_SIZE = 100000       // chars per chunk (~25k tokens for GPT-4 class)
-const CHUNK_OVERLAP = 5000      // overlap between chunks to preserve context
-const MAX_CHUNKS = 20           // safety ceiling: docs > 2M chars get truncated
+const CHUNK_SIZE = 100000        // chars per chunk (~25k tokens for GPT-4 class)
+const CHUNK_OVERLAP = 500        // tiny raw overlap; real continuity comes from CHUNK_CONTEXT_CHARS carryover
+const CHUNK_CONTEXT_CHARS = 20000 // ~5000 tokens of carryover from prior chunks (prepended to each chunk)
+const MAX_CHUNKS = 40            // safety ceiling on number of chunks
 
 // Tier ranking for merge (higher number = higher tier)
 const TIER_RANK: Record<string, number> = {
@@ -218,13 +216,23 @@ function splitIntoChunks(text: string, chunkSize: number, overlap: number): stri
       }
     }
     chunks.push(text.slice(i, breakPoint))
-    i = Math.max(breakPoint - overlap, i + 1)
+    // Advance to the break point, applying a SMALL raw overlap. Guarantee real
+    // forward progress: never step back more than a fraction of the chunk, so a
+    // large `overlap` relative to `chunkSize` can't stall the loop (which would
+    // otherwise explode into MAX_CHUNKS tiny pieces). Cross-boundary continuity
+    // is handled separately by the carryover context prepended to each chunk.
+    const safeOverlap = Math.min(overlap, Math.floor(chunkSize * 0.1))
+    const nextStart = Math.max(breakPoint - safeOverlap, i + Math.floor(chunkSize * 0.5))
+    // If the remaining tail is only overlap-sized (already fully covered by the
+    // last chunk), stop — avoids a redundant micro-chunk at the end.
+    if (text.length - nextStart <= safeOverlap) break
+    i = nextStart
   }
   return chunks
 }
 
 // ════════════════════════════════════════════════════════════════
-//  LOW-LEVEL API CALL (works for both OpenAI and Kimi)
+//  LOW-LEVEL API CALL (OpenAI / OpenAI-compatible chat completions)
 // ════════════════════════════════════════════════════════════════
 
 interface ApiConfig {
@@ -235,7 +243,7 @@ interface ApiConfig {
 }
 
 async function callLlmApi(config: ApiConfig, systemPrompt: string, userContent: any, images: string[]) {
-  const isReasoning = /^(gpt-5|o1|o3|o4|kimi)/i.test(config.model)
+  const isReasoning = /^(gpt-5|o1|o3|o4)/i.test(config.model)
   const reqBody: any = {
     model: config.model,
     messages: [
@@ -249,7 +257,7 @@ async function callLlmApi(config: ApiConfig, systemPrompt: string, userContent: 
 
   if (isReasoning) {
     reqBody.reasoning_effort = config.reasoningEffort || 'low'
-    // Kimi 2.6 has massive context, give more room for reasoning + output
+    // Reasoning models need extra room for reasoning tokens + the JSON output.
     reqBody.max_completion_tokens = 16000
   } else {
     reqBody.max_tokens = 4000
@@ -335,15 +343,23 @@ async function analyzeOneChunk(
   material: string,
   images: string[],
   chunkIndex: number,
-  totalChunks: number
+  totalChunks: number,
+  /** ~5000-token tail of the PREVIOUS chunk(s), for cross-boundary context. */
+  carryover: string = ''
 ): Promise<any> {
   const textPart =
     (ctx.length ? `INVESTOR-PROVIDED CONTEXT:\n${ctx.join('\n')}\n\n` : '') +
+    (carryover.trim().length
+      ? `CONTEXT FROM THE PRECEDING PART OF THE SAME DOCUMENT (for continuity only — ` +
+        `do NOT re-flag evidence that lives entirely in this context; flag it only if it ` +
+        `also appears in the NEW MATERIAL below):\n"""\n${carryover}\n"""\n\n`
+      : '') +
     (material.trim().length
-      ? `SUBMITTED MATERIAL (text) TO ANALYZE — PART ${chunkIndex + 1} of ${totalChunks}:\n"""\n${material}\n"""\n\n` +
-        `This is chunk ${chunkIndex + 1} of ${totalChunks}. Analyze ONLY the content in this chunk. ` +
-        `Flag any evidence you see. If the full document is referenced elsewhere, you may note ` +
-        `missing evidence as GAP. Return the JSON result for this chunk.\n\n`
+      ? `NEW MATERIAL (text) TO ANALYZE — PART ${chunkIndex + 1} of ${totalChunks}:\n"""\n${material}\n"""\n\n` +
+        `This is chunk ${chunkIndex + 1} of ${totalChunks}. Analyze the NEW MATERIAL above ` +
+        `(using the preceding context only to understand references that span the boundary). ` +
+        `Flag any evidence you see. If a required disclosure is simply absent, note it as GAP. ` +
+        `Return the JSON result for this chunk.\n\n`
       : '') +
     (images.length > 0
       ? `The investor also attached ${images.length} image(s). Read ALL text and visual claims in the image(s) and treat them as submitted material.\n\n`
@@ -479,11 +495,8 @@ function mergeChunkResults(results: any[]): any {
 export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
   const apiKey = env.OPENAI_API_KEY
   const baseUrl = (env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '')
-  const kimiApiKey = env.KIMI_API_KEY
-  const kimiBaseUrl = (env.KIMI_BASE_URL || 'https://api.moonshot.ai/v1').replace(/\/$/, '')
-  const kimiModel = env.KIMI_MODEL || 'kimi-k2.6'
 
-  if (!apiKey && !kimiApiKey) {
+  if (!apiKey) {
     throw new Error('Analysis service is not configured. (Missing server API key.)')
   }
 
@@ -499,139 +512,97 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
 
   const rawMaterial = (input.material || '').trim()
 
-  // ── STRATEGY DECISION: Kimi vs Chunking vs Single Shot ──
-  // Priority order:
-  // 1. Kimi available + doc large enough → use Kimi (2M context = no chunking needed)
-  // 2. Doc fits in single chunk → use standard single-shot
-  // 3. Doc is large → chunk with OpenAI-compatible provider
+  // ── MODEL SELECTION (OpenAI-only) ──
+  // One API call uses ONE model. Selection rule:
+  //   • any image attached  → VISION model (image + text analyzed together, single prompt)
+  //   • text-only, short doc → TEXT model  (fast, cheap)
+  //   • text-only, long doc  → LARGE model (higher capability), and doc is chunked
+  const textModel = env.OPENAI_TEXT_MODEL || 'gpt-5.4-mini'
+  const visionModel = env.OPENAI_VISION_MODEL || 'gpt-5.4'
+  const largeModel = env.OPENAI_LARGE_MODEL || textModel
 
-  const KIMI_THRESHOLD = Number(env.KIMI_DOC_CHARS) || 150000
-  const hasKimi = !!kimiApiKey
-  const useKimi = hasKimi && rawMaterial.length >= KIMI_THRESHOLD
+  const MAX_MATERIAL = Number(env.OPENAI_MAX_MATERIAL_CHARS) || CHUNK_SIZE
+  const CARRYOVER = Number(env.OPENAI_CHUNK_CONTEXT_CHARS) || CHUNK_CONTEXT_CHARS
+  const LARGE_DOC_CHARS = Number(env.OPENAI_LARGE_DOC_CHARS) || Number.MAX_SAFE_INTEGER
+  const isLongDoc = rawMaterial.length >= LARGE_DOC_CHARS || rawMaterial.length > MAX_MATERIAL
 
   let results: any[]
 
-  if (useKimi) {
-    // ── KIMI (kimi-k2.6): SINGLE SHOT ──
-    // Real context window = 262,144 tokens (~256K), roughly ~800K chars of English.
-    // We cap the material well under that to leave room for the system prompt and
-    // the JSON output, so large docs still go in one shot without chunking.
-    const config: ApiConfig = {
-      apiKey: kimiApiKey,
-      baseUrl: kimiBaseUrl,
-      model: kimiModel,
-    }
-    const KIMI_MATERIAL_CAP = 600000 // ~180K tokens of material; leaves headroom
-    const material = rawMaterial.slice(0, KIMI_MATERIAL_CAP)
-    const wasTruncated = rawMaterial.length > KIMI_MATERIAL_CAP
+  if (rawMaterial.length <= MAX_MATERIAL) {
+    // ── SINGLE SHOT: whole doc fits in one call ──
+    // Image → vision model; else long → large model; else → text model.
+    const model = env.OPENAI_MODEL || (hasImages ? visionModel : isLongDoc ? largeModel : textModel)
 
+    const config: ApiConfig = { apiKey, baseUrl, model, reasoningEffort: env.OPENAI_REASONING_EFFORT }
+
+    const material = rawMaterial
     const textPart =
       (ctx.length ? `INVESTOR-PROVIDED CONTEXT:\n${ctx.join('\n')}\n\n` : '') +
       (material.trim().length
-        ? `SUBMITTED MATERIAL (text) TO ANALYZE${wasTruncated ? ' (very long document — analyze the full body provided)' : ''}:\n"""\n${material}\n"""\n\n`
+        ? `SUBMITTED MATERIAL (text) TO ANALYZE:\n"""\n${material}\n"""\n\n`
         : '') +
       (hasImages
         ? `The investor also attached ${images.length} image(s) (e.g. a screenshot of an ad, email, or pitch-deck page). Read ALL text and visual claims in the image(s) and treat them as submitted material.\n\n`
         : '') +
       `Analyze everything provided using the 21-flag framework and return the JSON object only.`
 
+    // Image(s) + text go together in ONE prompt (single vision call).
     const userContent = hasImages
       ? [{ type: 'text', text: textPart }, ...images.map((url) => ({ type: 'image_url', image_url: { url } }))]
       : textPart
 
     const resp = await callLlmApi(config, SYSTEM_PROMPT, userContent, images)
-
     if (!resp.ok) {
       const txt = await resp.text().catch(() => '')
       handleApiError(resp, txt)
     }
-
     const data: any = await resp.json()
     const content = data?.choices?.[0]?.message?.content
     const finish = data?.choices?.[0]?.finish_reason
-    if (!content) throw new Error('Kimi analysis service returned an empty response.')
+    if (!content) throw new Error('Analysis service returned an empty response.')
 
     results = [parseResponse(content, finish)]
 
   } else {
-    // ── OPENAI-COMPATIBLE: CHUNK OR SINGLE SHOT ──
-    const MAX_MATERIAL = Number(env.OPENAI_MAX_MATERIAL_CHARS) || CHUNK_SIZE
+    // ── LARGE TEXT DOC: SEQUENTIAL CHUNKING WITH ~5000-TOKEN CARRYOVER ──
+    // Chunks are analyzed in order. Each chunk is prepended with the tail
+    // (~CARRYOVER chars ≈ 5000 tokens) of the accumulated prior text so that
+    // context flows across boundaries. If images are also attached, they ride
+    // on the FIRST chunk and that chunk uses the vision model.
+    const chunks = splitIntoChunks(rawMaterial, MAX_MATERIAL, CHUNK_OVERLAP)
+    const chunkModel = env.OPENAI_MODEL || largeModel
 
-    if (rawMaterial.length <= MAX_MATERIAL) {
-      // Doc fits in one chunk → single shot (fast, cheap). Images ALWAYS use the
-      // vision model here so screenshots/pitch-deck pages are read correctly.
-      const textModel = env.OPENAI_TEXT_MODEL || 'gpt-5.4-mini'
-      const visionModel = env.OPENAI_VISION_MODEL || 'gpt-5.4'
-      const largeModel = env.OPENAI_LARGE_MODEL || textModel
-      const LARGE_DOC_CHARS = Number(env.OPENAI_LARGE_DOC_CHARS) || Number.MAX_SAFE_INTEGER
-      const isLargeDoc = rawMaterial.length >= LARGE_DOC_CHARS
-      const model = env.OPENAI_MODEL || (hasImages ? visionModel : isLargeDoc ? largeModel : textModel)
+    const baseConfig: ApiConfig = {
+      apiKey,
+      baseUrl,
+      model: chunkModel,
+      reasoningEffort: env.OPENAI_REASONING_EFFORT,
+    }
 
-      const config: ApiConfig = {
-        apiKey,
-        baseUrl,
-        model,
-        reasoningEffort: env.OPENAI_REASONING_EFFORT,
-      }
+    results = []
+    let carryover = ''
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i]
+      const chunkHasImages = i === 0 && hasImages
+      // First chunk with images must use the vision model so the image is read.
+      const cfg: ApiConfig = chunkHasImages ? { ...baseConfig, model: env.OPENAI_MODEL || visionModel } : baseConfig
 
-      const material = rawMaterial.slice(0, MAX_MATERIAL)
-      const wasTruncated = rawMaterial.length > MAX_MATERIAL
-
-      const textPart =
-        (ctx.length ? `INVESTOR-PROVIDED CONTEXT:\n${ctx.join('\n')}\n\n` : '') +
-        (material.trim().length
-          ? `SUBMITTED MATERIAL (text) TO ANALYZE${wasTruncated ? ' (long document — analyze what is provided)' : ''}:\n"""\n${material}\n"""\n\n`
-          : '') +
-        (hasImages
-          ? `The investor also attached ${images.length} image(s) (e.g. a screenshot of an ad, email, or pitch-deck page). Read ALL text and visual claims in the image(s) and treat them as submitted material.\n\n`
-          : '') +
-        `Analyze everything provided using the 21-flag framework and return the JSON object only.`
-
-      const userContent = hasImages
-        ? [{ type: 'text', text: textPart }, ...images.map((url) => ({ type: 'image_url', image_url: { url } }))]
-        : textPart
-
-      const resp = await callLlmApi(config, SYSTEM_PROMPT, userContent, images)
-
-      if (!resp.ok) {
-        const txt = await resp.text().catch(() => '')
-        handleApiError(resp, txt)
-      }
-
-      const data: any = await resp.json()
-      const content = data?.choices?.[0]?.message?.content
-      const finish = data?.choices?.[0]?.finish_reason
-      if (!content) throw new Error('Analysis service returned an empty response.')
-
-      results = [parseResponse(content, finish)]
-
-    } else {
-      // ── LARGE DOC: CHUNK + PARALLEL ANALYZE ──
-      const chunks = splitIntoChunks(rawMaterial, MAX_MATERIAL, CHUNK_OVERLAP)
-
-      // For chunking, use the large model if configured, otherwise text model.
-      // If images are attached (to chunk 0), prefer the vision model so they're read.
-      const textModel = env.OPENAI_TEXT_MODEL || 'gpt-5.4-mini'
-      const visionModel = env.OPENAI_VISION_MODEL || 'gpt-5.4'
-      const largeModel = env.OPENAI_LARGE_MODEL || textModel
-      const chunkModel = env.OPENAI_MODEL || (hasImages ? visionModel : largeModel)
-
-      const config: ApiConfig = {
-        apiKey,
-        baseUrl,
-        model: chunkModel,
-        reasoningEffort: env.OPENAI_REASONING_EFFORT,
-      }
-
-      // If images are present, attach them only to the FIRST chunk (they're the same across all)
-      const chunkImages = hasImages ? images : []
-
-      // Analyze all chunks in parallel
-      results = await Promise.all(
-        chunks.map((chunk, i) =>
-          analyzeOneChunk(env, config, ctx, chunk, i === 0 ? chunkImages : [], i, chunks.length)
-        )
+      const res = await analyzeOneChunk(
+        env,
+        cfg,
+        ctx,
+        chunk,
+        chunkHasImages ? images : [],
+        i,
+        chunks.length,
+        carryover
       )
+      results.push(res)
+
+      // Build carryover for the NEXT chunk: keep the last ~CARRYOVER chars of
+      // the text seen so far (previous carryover tail + this chunk's tail).
+      const combined = (carryover + '\n' + chunk)
+      carryover = combined.slice(-CARRYOVER)
     }
   }
 
