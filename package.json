@@ -9,7 +9,10 @@
     "deploy": "npm run build && wrangler pages deploy dist --project-name investsafe-pro",
     "clean-port": "fuser -k 3000/tcp 2>/dev/null || true",
     "test": "curl http://localhost:3000",
-    "cf-typegen": "wrangler types --env-interface CloudflareBindings"
+    "cf-typegen": "wrangler types --env-interface CloudflareBindings",
+    "db:migrate:local": "wrangler d1 migrations apply investsafe-jobs --local",
+    "db:migrate:prod": "wrangler d1 migrations apply investsafe-jobs",
+    "db:reset": "rm -rf .wrangler/state/v3/d1 && wrangler d1 migrations apply investsafe-jobs --local"
   },
   "dependencies": {
     "hono": "^4.12.23"

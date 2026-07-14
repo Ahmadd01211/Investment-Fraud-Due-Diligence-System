@@ -5,30 +5,25 @@
   "pages_build_output_dir": "./dist",
   "compatibility_flags": [
     "nodejs_compat"
+  ],
+  // ── Async analysis job store ──
+  // D1 holds jobs + per-chunk evaluations; R2 holds raw uploads + extracted
+  // text. Provisioned by the hosted-deploy path. If absent (local dev without
+  // a DB), the app falls back to the browser-driven chunk pipeline.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "investsafe-jobs",
+      "database_id": "local"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "R2",
+      "bucket_name": "investsafe-uploads"
+    }
   ]
-  // "vars": {
-  //   "MY_VAR": "my-variable"
-  // },
   // "kv_namespaces": [
-  //   {
-  //     "binding": "MY_KV_NAMESPACE",
-  //     "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-  //   }
+  //   { "binding": "KV", "id": "xxxx" }
   // ],
-  // "r2_buckets": [
-  //   {
-  //     "binding": "MY_BUCKET",
-  //     "bucket_name": "my-bucket"
-  //   }
-  // ],
-  // "d1_databases": [
-  //   {
-  //     "binding": "MY_DB",
-  //     "database_name": "my-database",
-  //     "database_id": ""
-  //   }
-  // ],
-  // "ai": {
-  //   "binding": "AI"
-  // }
 }

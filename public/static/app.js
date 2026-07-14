@@ -107,15 +107,16 @@
     const buf = await readAsArrayBuffer(file);
     const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
     let out = '';
-    const pages = Math.min(pdf.numPages, 2000);
+    // NO content truncation — the backend chunk-and-merge pipeline handles any
+    // size. We only guard against a pathological page count to protect browser
+    // memory; real documents fall far under this.
+    const pages = Math.min(pdf.numPages, 20000);
     for (let i = 1; i <= pages; i++) {
       const page = await pdf.getPage(i);
       const content = await page.getTextContent();
-      out += content.items.map((it) => it.str).join(' ') + '\n\n';
-      // The backend now handles unlimited size (chunk-and-merge, and Kimi 2.6's
-      // 2M-token context for very large docs). Extract the full document up to a
-      // generous safety cap so nothing meaningful is lost.
-      if (out.length > 2000000) break;
+      // Emit an explicit page marker before each page's text so the backend can
+      // map extracted-text offsets back to page numbers for evidence refs.
+      out += `\n[[PAGE ${i}]]\n` + content.items.map((it) => it.str).join(' ') + '\n';
     }
     return out.trim();
   }
@@ -273,6 +274,153 @@
   const LOAD_MSGS = ['Reading the document…', 'Extracting the promoter\'s claims…', 'Checking 21 fraud patterns…', 'Cross-referencing with known schemes…', 'Building your report…'];
   let msgTimer;
   function cycleMsgs() { let i = 0; loadingMsg.textContent = LOAD_MSGS[0]; msgTimer = setInterval(() => { i = (i + 1) % LOAD_MSGS.length; loadingMsg.textContent = LOAD_MSGS[i]; }, 1700); }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /* ── ASYNC JOB PIPELINE (R2 + D1 + tick processor + polling) ──
+     Upload returns a Job ID immediately; we then repeatedly "tick" the job
+     (each tick analyzes one chunk, or runs the final merge+report) and poll
+     progress. No single request is long-running → no Cloudflare timeout. */
+  async function runAsyncJob(text, images, meta, handleErr) {
+    clearInterval(msgTimer);
+    loadingMsg.textContent = 'Uploading document…';
+
+    const cres = await fetch('/api/jobs', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ material: text, images, ...meta }),
+    });
+    const cdata = await cres.json();
+    if (handleErr(cdata, cres)) return null;
+    const jobId = cdata.jobId;
+    const total = Number(cdata.totalChunks) || 1;
+    loadingMsg.textContent = `Analyzing document — 0 of ${total} sections…`;
+
+    // Drive the job to completion by ticking. Each tick = one unit of work.
+    let guard = 0;
+    const MAX_TICKS = total + 8 + total * 6; // chunks + merge/report + retry budget
+    while (guard++ < MAX_TICKS) {
+      const tres = await fetch(`/api/jobs/${jobId}/tick`, { method: 'POST' });
+      let t;
+      try { t = await tres.json(); } catch { t = {}; }
+
+      if (t.error && tres.status !== 429) {
+        // Non-retryable job error.
+        if (tres.status === 422 && t.error === 'invalid_submission') { if (handleErr(t, tres)) return null; }
+        throw new Error(t.message || t.error || 'Analysis failed.');
+      }
+
+      const done = Number(t.doneChunks) || 0;
+      const prog = Number(t.progress) || 0;
+      if (t.status === 'merging' || t.status === 'reporting') {
+        loadingMsg.textContent = 'Combining findings into your final report…';
+      } else {
+        loadingMsg.textContent = `Analyzing document — ${done} of ${total} sections… (${prog}%)`;
+      }
+
+      if (t.status === 'not_relevant') {
+        showState('empty');
+        showNotice("This doesn't look like an investment",
+          'The document did not appear to be an investment offering, pitch, or solicitation. Please submit an investment-related document.');
+        toast('Not an investment — nothing to analyze', 'err');
+        return null;
+      }
+      if (t.finished || t.status === 'done') break;
+
+      // Rate-limit backoff hint from the server (provider TPM window).
+      if (t.retryAfter) {
+        const w = Math.max(1, Number(t.retryAfter));
+        loadingMsg.textContent = `Analyzing document — ${done} of ${total} sections… (service busy, waiting ${w}s)`;
+        await sleep(w * 1000 + 300);
+      } else {
+        await sleep(350); // gentle pacing between ticks
+      }
+    }
+
+    // Fetch the final assembled result.
+    const rres = await fetch(`/api/jobs/${jobId}/result`);
+    const rdata = await rres.json();
+    if (!rres.ok || rdata.error) throw new Error(rdata.error || 'Could not retrieve the report.');
+    return rdata.result;
+  }
+
+  /* ── BROWSER-DRIVEN FALLBACK (no D1/R2): split → analyze-chunk → merge ── */
+  async function runBrowserPipeline(text, images, meta, handleErr) {
+    clearInterval(msgTimer);
+
+    // Small doc or images → single request.
+    let plan = { needsChunking: false, totalChunks: 1 };
+    if (images.length === 0 && text.length > 0) {
+      try {
+        const pr = await fetch('/api/chunk-plan?len=' + text.length);
+        if (pr.ok) plan = await pr.json();
+      } catch { /* single-shot */ }
+    }
+
+    if (!plan.needsChunking) {
+      const res = await fetch('/api/analyze', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ material: text, images, ...meta }),
+      });
+      const data = await res.json();
+      if (handleErr(data, res)) return null;
+      return data.result;
+    }
+
+    // Large doc: server splits semantically, we analyze each chunk.
+    const sres = await fetch('/api/split', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ material: text }),
+    });
+    const sdata = await sres.json();
+    if (!sres.ok || sdata.error) throw new Error(sdata.error || 'Could not prepare the document.');
+    const chunks = sdata.chunks || [];
+    const total = chunks.length;
+
+    const results = [];
+    for (let i = 0; i < total; i++) {
+      const ch = chunks[i];
+      loadingMsg.textContent = `Analyzing large document — part ${i + 1} of ${total}… (${Math.round((i / total) * 100)}%)`;
+
+      const MAX_RETRIES = 4;
+      let data = null, res = null;
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        res = await fetch('/api/analyze-chunk', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chunk: ch.text, chunkIndex: ch.chunk_id, totalChunks: total,
+            startPage: ch.startPage, endPage: ch.endPage, headings: ch.headings,
+            images: i === 0 ? images : [], ...meta,
+          }),
+        });
+        data = await res.json();
+        if ((res.status === 429 || res.status === 503) && attempt < MAX_RETRIES) {
+          const hint = Number(data && data.retryAfter) || 0;
+          const wait = Math.max(hint * 1000 + 500, Math.round(2000 * Math.pow(2, attempt)));
+          loadingMsg.textContent = `Analyzing large document — part ${i + 1} of ${total}… (service busy, retrying in ${Math.round(wait / 1000)}s)`;
+          await sleep(wait);
+          continue;
+        }
+        break;
+      }
+      if (!res.ok && data && data.error !== 'invalid_submission') {
+        throw new Error((data && (data.message || data.error)) || `Analysis failed on part ${i + 1}.`);
+      }
+      if (data && data.result) results.push(data.result);
+      if (i < total - 1) await sleep(600);
+    }
+
+    if (results.length === 0) {
+      throw new Error('The analysis service was busy and no parts could be analyzed. Please try again in a minute.');
+    }
+
+    loadingMsg.textContent = 'Combining findings into your final report…';
+    const mres = await fetch('/api/merge', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ results }),
+    });
+    const mdata = await mres.json();
+    if (handleErr(mdata, mres)) return null;
+    return mdata.result;
+  }
 
   async function analyze() {
     const text = material.value.trim();
@@ -311,112 +459,22 @@
     };
 
     try {
-      // Ask the server whether this document needs the multi-chunk pipeline.
-      // Images always go single-shot (one vision call).
-      let plan = { needsChunking: false, totalChunks: 1 };
-      if (images.length === 0 && text.length > 0) {
-        try {
-          const pr = await fetch('/api/chunk-plan?len=' + text.length);
-          if (pr.ok) plan = await pr.json();
-        } catch { /* fall back to single-shot */ }
-      }
+      // Detect whether the async job pipeline (D1/R2) is available on this
+      // deploy. If so, use it (upload → Job ID → poll+tick). Otherwise fall
+      // back to the browser-driven chunk pipeline (works without a DB).
+      let asyncJobs = false;
+      try {
+        const cap = await fetch('/api/capabilities');
+        if (cap.ok) asyncJobs = !!(await cap.json()).asyncJobs;
+      } catch { /* assume unavailable */ }
 
       let result;
-      if (!plan.needsChunking) {
-        // ── SINGLE SHOT (small doc or images) ── unchanged behaviour ──
-        const res = await fetch('/api/analyze', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ material: text, images, ...meta }),
-        });
-        const data = await res.json();
-        if (handleErr(data, res)) return;
-        result = data.result;
+      if (asyncJobs) {
+        result = await runAsyncJob(text, images, meta, handleErr);
+        if (result === null) return; // handled (e.g. not-an-investment notice)
       } else {
-        // ── LARGE DOC: browser-driven chunk pipeline ──
-        // 1) server splits authoritatively → 2) analyze each chunk (short
-        //    requests) → 3) merge server-side. Live progress in loadingMsg.
-        clearInterval(msgTimer); // stop the generic cycling messages
-        const sres = await fetch('/api/split', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ material: text }),
-        });
-        const sdata = await sres.json();
-        if (!sres.ok || sdata.error) throw new Error(sdata.error || 'Could not prepare the document.');
-        const chunks = sdata.chunks || [];
-        const carryChars = Number(sdata.carryover) || 0;
-        const total = chunks.length;
-
-        const results = [];
-        let carryover = '';
-        let acc = '';
-        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-        for (let i = 0; i < total; i++) {
-          const pct = Math.round((i / total) * 100);
-          loadingMsg.textContent = `Analyzing large document — part ${i + 1} of ${total}… (${pct}%)`;
-
-          // Each chunk is a short request. Retry transient rate-limit / busy
-          // responses (429/503) with exponential backoff so a big document
-          // doesn't fail just because chunks were sent close together.
-          const MAX_RETRIES = 4;
-          let data = null, res = null, done = false;
-          for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-            res = await fetch('/api/analyze-chunk', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chunk: chunks[i],
-                chunkIndex: i,
-                totalChunks: total,
-                carryover,
-                images: i === 0 ? images : [], // only first chunk carries images
-                ...meta,
-              }),
-            });
-            data = await res.json();
-            if (res.status === 429 || res.status === 503) {
-              if (attempt < MAX_RETRIES) {
-                // Honor the server's retry-after hint (from OpenAI's TPM
-                // window) when present; otherwise exponential backoff.
-                const hint = Number(data && data.retryAfter) || 0;
-                const backoff = Math.round(2000 * Math.pow(2, attempt)); // 2s,4s,8s,16s
-                const wait = Math.max(hint * 1000 + 500, backoff);
-                loadingMsg.textContent =
-                  `Analyzing large document — part ${i + 1} of ${total}… (service busy, retrying in ${Math.round(wait / 1000)}s)`;
-                await sleep(wait);
-                continue;
-              }
-            }
-            done = true;
-            break;
-          }
-
-          // A single chunk being "not an investment" shouldn't abort the whole
-          // doc — the merge step applies the majority relevance gate.
-          if (!res.ok && data && data.error !== 'invalid_submission') {
-            throw new Error((data && (data.message || data.error)) || `Analysis failed on part ${i + 1}.`);
-          }
-          if (data && data.result) results.push(data.result);
-
-          // Gentle pacing between chunks to stay under provider rate limits.
-          if (i < total - 1) await sleep(600);
-
-          // Carryover for the NEXT chunk = last `carryChars` chars seen so far
-          // (mirrors the server's carryover threading exactly).
-          acc = (acc + '\n' + chunks[i]);
-          carryover = carryChars > 0 ? acc.slice(-carryChars) : '';
-        }
-
-        if (results.length === 0) {
-          throw new Error('The analysis service was busy and no parts could be analyzed. Please try again in a minute.');
-        }
-
-        loadingMsg.textContent = 'Combining findings into your final report…';
-        const mres = await fetch('/api/merge', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ results }),
-        });
-        const mdata = await mres.json();
-        if (handleErr(mdata, mres)) return;
-        result = mdata.result;
+        result = await runBrowserPipeline(text, images, meta, handleErr);
+        if (result === null) return;
       }
 
       renderResult(result);
