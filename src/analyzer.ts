@@ -39,7 +39,9 @@ import {
   type RuleFinding,
 } from './rules'
 import {
+  chunkDocument,
   type Chunk,
+  type ChunkOptions,
 } from './chunking'
 import { mergeEvaluations, type MergedDataset, type MergedFinding } from './merge'
 
@@ -144,13 +146,40 @@ function buildCtx(input: Partial<AnalyzeInput>): string[] {
 // ════════════════════════════════════════════════════════════════
 
 /**
- * Single-pass mode: disable server chunking and analyze in one LLM request.
- * (Requested for GPT-5 large-context usage.)
+ * Resolve chunk sizing from env (with safe defaults). maxChunkChars is the
+ * ceiling on how much text goes into a SINGLE LLM request; it is kept well
+ * below the model's context window so a chunk's structured JSON output never
+ * hits the output-token cap (which would truncate findings).
  */
-export function buildChunks(_env: Bindings, material: string): Chunk[] {
+function resolveChunkOptions(env: Bindings): ChunkOptions {
+  const toInt = (v: any, d: number) => {
+    const n = parseInt(String(v ?? ''), 10)
+    return Number.isFinite(n) && n > 0 ? n : d
+  }
+  const maxChunkChars = clamp(toInt(env.MAX_CHUNK_CHARS, 40000), 8000, 120000)
+  const minChunkChars = clamp(toInt(env.MIN_CHUNK_CHARS, 4000), 500, maxChunkChars)
+  const skipBoilerplate = String(env.SKIP_BOILERPLATE ?? 'true').toLowerCase() !== 'false'
+  return { maxChunkChars, minChunkChars, maxChunks: 400, skipBoilerplate }
+}
+
+/**
+ * Build the analysis chunks for a document.
+ *   • Small doc (≤ maxChunkChars) → ONE request (cheapest, no overhead).
+ *   • Large doc → semantic, page-aware chunks so the FULL text is analyzed —
+ *     nothing is truncated, and no single request overflows the model's
+ *     context or output-token budget.
+ * Any attached/scanned images were already OCR'd into `material` upstream, so
+ * their text is chunked here too and never dropped.
+ */
+export function buildChunks(env: Bindings, material: string): Chunk[] {
   const text = String(material || '').trim()
   if (!text) return []
-  return [{ chunk_id: 0, text, startPage: 1, endPage: 1, headings: [] }]
+  const opts = resolveChunkOptions(env)
+  if (text.length <= opts.maxChunkChars) {
+    // Keep [[PAGE n]] markers intact for single-pass so the model can cite pages.
+    return [{ chunk_id: 0, text, startPage: 1, endPage: 1, headings: [] }]
+  }
+  return chunkDocument(text, opts)
 }
 
 export interface ChunkPlanInfo {
@@ -159,12 +188,19 @@ export interface ChunkPlanInfo {
   maxChunkChars: number
 }
 
-/** Report the chunking plan. In single-pass mode chunking is always disabled. */
-export function getChunkPlan(_env: Bindings, _docLenOrText: number | string): ChunkPlanInfo {
-  return { needsChunking: false, totalChunks: 1, maxChunkChars: 0 }
+/** Report the chunking plan for a document of the given length/text. */
+export function getChunkPlan(env: Bindings, docLenOrText: number | string): ChunkPlanInfo {
+  const len = typeof docLenOrText === 'number' ? docLenOrText : String(docLenOrText || '').length
+  const opts = resolveChunkOptions(env)
+  const needsChunking = len > opts.maxChunkChars
+  return {
+    needsChunking,
+    totalChunks: needsChunking ? Math.max(2, Math.ceil(len / opts.maxChunkChars)) : 1,
+    maxChunkChars: opts.maxChunkChars,
+  }
 }
 
-/** Authoritative server-side split (single-pass mode always returns one chunk). */
+/** Authoritative server-side split (semantic, page-aware; never truncates). */
 export function splitDocument(env: Bindings, text: string): { chunks: Chunk[] } {
   return { chunks: buildChunks(env, text) }
 }

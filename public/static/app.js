@@ -198,7 +198,14 @@
   const attachedImages = []; // { name, dataUrl }
   const MAX_IMAGES = 120;
   const IMAGE_BATCH_SIZE = 10;
-  const MAX_FILE = 12 * 1024 * 1024; // 12 MB per file
+  // Documents (PDF/DOCX/TXT) are parsed IN THE BROWSER and only their extracted
+  // text — or compressed renders of image-only pages — are uploaded. The raw
+  // file itself is never sent, so it can be large. 100 MB is the Cloudflare edge
+  // request cap (a safety guard, not a per-page limit).
+  const MAX_FILE = 100 * 1024 * 1024; // 100 MB per document
+  // Raw image attachments ARE sent to the vision model as-is, and OpenAI rejects
+  // images larger than ~20 MB — so image files are capped separately.
+  const MAX_IMAGE_FILE = 20 * 1024 * 1024; // 20 MB per image
 
   function fileKind(file) {
     const n = (file.name || '').toLowerCase();
@@ -378,8 +385,14 @@
     resetPrecheckApproval();
     hidePrecheckCard();
     for (const file of files) {
-      if (file.size > MAX_FILE) { toast(`"${file.name}" is too large (max 12 MB).`, 'err'); continue; }
       const kind = fileKind(file);
+      // Images are uploaded whole to the vision model → enforce OpenAI's ~20 MB
+      // per-image limit. Documents are parsed locally (only text leaves the
+      // browser) → only the generous 100 MB edge guard applies.
+      if (kind === 'image' && file.size > MAX_IMAGE_FILE) {
+        toast(`"${file.name}" is too large — images must be under 20 MB.`, 'err'); continue;
+      }
+      if (file.size > MAX_FILE) { toast(`"${file.name}" is too large (max 100 MB).`, 'err'); continue; }
       try {
         if (kind === 'image') {
           if (attachedImages.length >= MAX_IMAGES) { toast(`You can attach up to ${MAX_IMAGES} images.`, 'err'); continue; }

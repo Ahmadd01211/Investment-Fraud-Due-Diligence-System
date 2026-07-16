@@ -119,7 +119,7 @@ app.post('/api/jobs', async (c) => {
   }
   const material = (body?.material || '').toString().trim()
   const images: string[] = Array.isArray(body?.images)
-    ? body.images.filter((s: any) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 10)
+    ? body.images.filter((s: any) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 120)
     : []
   if (material.length < 30 && images.length === 0) {
     return c.json({ error: 'Please paste at least a few sentences — or attach a document/image — so we can analyze it.' }, 400)
@@ -153,8 +153,14 @@ app.get('/api/jobs/:id', async (c) => {
   const status = await getJobStatus(c.env, jobId)
   if (!status) return c.json({ error: 'Job not found.' }, 404)
 
-  // Auto-kick background runner on polling so interrupted sessions can resume processing.
-  if (status.status === 'analyzing' || status.status === 'merging' || status.status === 'reporting') {
+  // Auto-kick a background runner ONLY when the job looks stalled (no progress
+  // for a while) so an interrupted session can resume. Kicking on every poll
+  // spawns a herd of concurrent runners that each re-send the whole document to
+  // the LLM — the cause of runaway token usage. The in-DB chunk/phase locks
+  // make duplicates safe, but not re-kicking unless stalled avoids the waste.
+  const active = status.status === 'analyzing' || status.status === 'merging' || status.status === 'reporting'
+  const stalledMs = Date.now() - (status.updatedAt || 0)
+  if (active && stalledMs > 15000) {
     c.executionCtx.waitUntil(processJobToCompletion(c.env, jobId).catch(() => {}))
   }
 
@@ -193,7 +199,7 @@ app.post('/api/analyze', async (c) => {
   }
   const material = (body?.material || '').toString().trim()
   const images: string[] = Array.isArray(body?.images)
-    ? body.images.filter((s: any) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 10)
+    ? body.images.filter((s: any) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 120)
     : []
   if (material.length < 30 && images.length === 0) {
     return c.json({ error: 'Please paste at least a few sentences — or attach a document or image of the investment pitch — so we can analyze it.' }, 400)
@@ -253,7 +259,7 @@ app.post('/api/analyze-chunk', async (c) => {
   }
   const chunk = (body?.chunk || '').toString()
   const images: string[] = Array.isArray(body?.images)
-    ? body.images.filter((s: any) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 10)
+    ? body.images.filter((s: any) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 120)
     : []
   if (chunk.trim().length === 0 && images.length === 0) {
     return c.json({ error: 'Empty chunk.' }, 400)

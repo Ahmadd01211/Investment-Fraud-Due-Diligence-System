@@ -70,6 +70,12 @@ function now() {
   return Date.now()
 }
 
+// A chunk left "processing" (or a job left "merging"/"reporting") longer than
+// this window is presumed abandoned — its runner isolate was evicted before it
+// could finish — and may be reclaimed by another runner. Prevents a dead
+// runner from deadlocking the job while still blocking live duplicates.
+const STALE_LOCK_MS = 90_000
+
 function newJobId(): string {
   const rand = crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '').slice(0, 12) : Math.random().toString(36).slice(2, 14)
   return `job_${Date.now().toString(36)}_${rand}`
@@ -152,6 +158,8 @@ export interface JobStatus {
   progress: number
   error?: string
   hasResult: boolean
+  /** Last time the job row was touched (ms epoch) — used for stall detection. */
+  updatedAt: number
 }
 
 export async function getJobStatus(env: Bindings, jobId: string): Promise<JobStatus | null> {
@@ -168,6 +176,7 @@ export async function getJobStatus(env: Bindings, jobId: string): Promise<JobSta
     progress: total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0,
     error: row.error_message || undefined,
     hasResult: !!row.result_json,
+    updatedAt: Number(row.updated_at) || 0,
   }
 }
 
@@ -235,11 +244,17 @@ export async function processNextUnit(env: Bindings, jobId: string): Promise<Tic
   if (context.amountAsked) ctx.push(`Minimum investment / amount asked: ${context.amountAsked}`)
   if (context.sourceType) ctx.push(`Where this came from: ${context.sourceType}`)
 
-  // ── 1. Analyze the next pending chunk, if any ──
+  // ── 1. Analyze the next claimable chunk, if any ──
+  //   "Claimable" = still 'pending', OR stuck 'processing' past the stale
+  //   window (its runner died). Fresh 'processing' chunks are owned by a live
+  //   concurrent runner and are intentionally NOT selected here.
+  const staleBefore = now() - STALE_LOCK_MS
   const nextChunk: any = await env.DB.prepare(
-    `SELECT * FROM job_chunks WHERE job_id = ? AND status = 'pending' ORDER BY chunk_id ASC LIMIT 1`
+    `SELECT * FROM job_chunks
+       WHERE job_id = ? AND (status = 'pending' OR (status = 'processing' AND updated_at < ?))
+       ORDER BY chunk_id ASC LIMIT 1`
   )
-    .bind(jobId)
+    .bind(jobId, staleBefore)
     .first()
 
   if (nextChunk) {
@@ -250,6 +265,23 @@ export async function processNextUnit(env: Bindings, jobId: string): Promise<Tic
       endPage: Number(nextChunk.end_page) || 0,
       headings: nextChunk.headings ? JSON.parse(nextChunk.headings) : [],
     }
+
+    // ATOMIC CLAIM — flip the chunk to 'processing' only if it is still
+    // claimable. When many pollers each spawn a runner, exactly ONE wins this
+    // UPDATE (changes === 1); the losers bail WITHOUT making a duplicate,
+    // billable LLM call. This is the fix for the token blow-up.
+    const claim = await env.DB.prepare(
+      `UPDATE job_chunks SET status = 'processing', updated_at = ?
+         WHERE job_id = ? AND chunk_id = ?
+           AND (status = 'pending' OR (status = 'processing' AND updated_at < ?))`
+    )
+      .bind(now(), jobId, chunk.chunk_id, staleBefore)
+      .run()
+    if (!claim?.meta?.changes) {
+      // Lost the race — another live runner owns this chunk. No-op this tick.
+      return mkResult({ status: 'analyzing' })
+    }
+
     try {
       // Images were OCR'd into the chunk text at job creation; text-only here.
       const evalResult: ChunkEvaluation = await evaluateChunk(provider, chunk, ctx)
@@ -258,7 +290,12 @@ export async function processNextUnit(env: Bindings, jobId: string): Promise<Tic
       )
         .bind(JSON.stringify(evalResult), now(), jobId, chunk.chunk_id)
         .run()
-      const newDone = done + 1
+      // Recount done chunks from the table (concurrent runners make the cached
+      // `done` unreliable).
+      const doneRow: any = await env.DB.prepare(
+        `SELECT COUNT(*) AS c FROM job_chunks WHERE job_id = ? AND status = 'done'`
+      ).bind(jobId).first()
+      const newDone = Number(doneRow?.c) || done + 1
       await touchJob(env, jobId, { done_chunks: newDone, provider: provider.name })
       return {
         jobId,
@@ -270,8 +307,12 @@ export async function processNextUnit(env: Bindings, jobId: string): Promise<Tic
       }
     } catch (err: any) {
       const msg = String(err?.message || '')
-      // Rate-limit → retryable: leave chunk pending, tell client to back off.
+      // Rate-limit → retryable: release the claim (back to 'pending') so a
+      // later tick can retry after backoff.
       if (msg.startsWith('SERVICE_RATELIMIT:')) {
+        await env.DB.prepare(`UPDATE job_chunks SET status = 'pending', updated_at = ? WHERE job_id = ? AND chunk_id = ?`)
+          .bind(now(), jobId, chunk.chunk_id)
+          .run()
         const secs = Number(msg.slice('SERVICE_RATELIMIT:'.length)) || 20
         return mkResult({ status: 'analyzing', retryAfter: secs })
       }
@@ -284,8 +325,29 @@ export async function processNextUnit(env: Bindings, jobId: string): Promise<Tic
     }
   }
 
-  // ── 2. No pending chunks → merge + report (deterministic score in TS) ──
-  await touchJob(env, jobId, { status: 'merging' })
+  // No claimable chunk. If any chunk is still in flight on a live runner, don't
+  // merge yet — just report progress and let the owner finish.
+  const inflight: any = await env.DB.prepare(
+    `SELECT COUNT(*) AS c FROM job_chunks WHERE job_id = ? AND status IN ('pending', 'processing')`
+  ).bind(jobId).first()
+  if ((Number(inflight?.c) || 0) > 0) {
+    return mkResult({ status: 'analyzing' })
+  }
+
+  // ── 2. All chunks done → merge + report (deterministic score in TS).
+  //   ATOMIC CLAIM of the merge/report phase so only ONE runner does it,
+  //   preventing duplicate (billable) report-generation calls. ──
+  const mergeClaim = await env.DB.prepare(
+    `UPDATE jobs SET status = 'merging', updated_at = ?
+       WHERE id = ? AND (status = 'analyzing'
+         OR ((status = 'merging' OR status = 'reporting') AND updated_at < ?))`
+  )
+    .bind(now(), jobId, staleBefore)
+    .run()
+  if (!mergeClaim?.meta?.changes) {
+    // Another runner is already merging/reporting (or the job just finished).
+    return mkResult({ status: job.status })
+  }
   const rows: any = await env.DB.prepare(`SELECT eval_json FROM job_chunks WHERE job_id = ? AND status = 'done' ORDER BY chunk_id ASC`)
     .bind(jobId)
     .all()

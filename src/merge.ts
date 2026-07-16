@@ -107,13 +107,16 @@ function dedupeEvidence(items: MergedEvidence[]): MergedEvidence[] {
 export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
   const clean = (Array.isArray(evals) ? evals : []).filter((e) => e && typeof e === 'object')
 
-  // ── Relevance gate: majority of chunks decide ──
+  // ── Relevance gate ──
+  //  A long document is split into many semantic chunks; dry legal/boilerplate
+  //  sections (definitions, financial tables, subscription terms) can each look
+  //  "non-investment" in isolation, so a strict MAJORITY vote wrongly zeros out
+  //  a valid PPM. Require only a meaningful SHARE of chunks (≥25%, min 1). The
+  //  stronger signal — any rule that actually triggered on concrete evidence —
+  //  forces relevance below, once findings are computed.
   const relevantVotes = clean.filter((e) => e.is_investment_related === true).length
-  const isInvestmentRelated = clean.length > 0 && relevantVotes > 0 && relevantVotes >= clean.length / 2
-  const notRelevantReason = isInvestmentRelated
-    ? ''
-    : String(clean.find((e) => e.not_relevant_reason)?.not_relevant_reason || '') ||
-      'This does not appear to be an investment offering, pitch, or solicitation.'
+  const relevanceThreshold = Math.max(1, Math.ceil(clean.length * 0.25))
+  let isInvestmentRelated = clean.length > 0 && relevantVotes >= relevanceThreshold
 
   // ── Per-rule accumulator ──
   interface Acc {
@@ -214,6 +217,23 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
   const totalWeightedPoints = triggered.reduce((s, f) => s + f.weightedPoints, 0)
   const maxPossiblePoints = triggered.reduce((s, f) => s + f.weight, 0)
 
+  // A rule that actually triggered (concrete evidence, above the confidence
+  // floor) is itself proof the document is investment-related — override a
+  // conservative relevance vote so real findings are never zeroed.
+  if (!isInvestmentRelated && triggered.length > 0) isInvestmentRelated = true
+
+  const notRelevantReason = isInvestmentRelated
+    ? ''
+    : String(clean.find((e) => e.not_relevant_reason)?.not_relevant_reason || '') ||
+      'This does not appear to be an investment offering, pitch, or solicitation.'
+
+  // Dispositive rules: a single Tier 1 hit on any of these is independently
+  // conclusive — floor the score at Critical (75) regardless of breadth.
+  const DISPOSITIVE_RULES = new Set([4, 5, 6, 8])
+  const hasDispositiveHit = triggered.some(
+    (f) => DISPOSITIVE_RULES.has(f.n) && f.evidenceTier === 'Tier 1'
+  )
+
   // If the material is not investment-related, force a neutral risk output.
   const riskScore = !isInvestmentRelated
     ? 0
@@ -222,7 +242,8 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
         const STABILITY_FLOOR = 40
         const floorWeight = triggered.length >= 4 ? 0 : STABILITY_FLOOR * (1 - triggered.length / 4)
         const denom = maxPossiblePoints + floorWeight
-        return denom > 0 ? clamp(Math.round((totalWeightedPoints / denom) * 100), 0, 100) : 0
+        const raw = denom > 0 ? clamp(Math.round((totalWeightedPoints / denom) * 100), 0, 100) : 0
+        return hasDispositiveHit ? Math.max(raw, 75) : raw
       })()
 
   const keyDrivers = isInvestmentRelated
