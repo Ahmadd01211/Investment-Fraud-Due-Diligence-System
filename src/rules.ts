@@ -61,11 +61,20 @@ export type EvidenceTier = (typeof VALID_TIERS)[number]
  * every time. The model only picks the tier; TypeScript assigns severity.
  * This table is the single source of truth for severity.
  */
+//  Calibration note: a triggered flag's weightedPoints = weight × severity ÷ 10,
+//  while the score denominator uses the FULL weight. So an all-Tier-2 document can
+//  never exceed severity/10 of its weight. Because a promoter's own marketing copy
+//  (ads, websites, emails) tops out at "Tier 2" by the evidence rubric — Tier 1 is
+//  reserved for a PPM/Form D/FINRA record — the old table (Tier 2 = 8, Tier 3 = 5)
+//  structurally capped marketing-scam scores at 50–80% even when many flags fired,
+//  producing "Low" verdicts on obvious frauds. The promoter stating the fraudulent
+//  claim in their OWN words is not weak evidence — it is a direct misrepresentation.
+//  Tiers 2/3 are lifted accordingly; Tier 4 (pure inference) stays low; GAP = 0.
 export const TIER_SEVERITY: Record<string, number> = {
   'Tier 1': 10,
-  'Tier 2': 8,
-  'Tier 3': 5,
-  'Tier 4': 3,
+  'Tier 2': 9,
+  'Tier 3': 7,
+  'Tier 4': 4,
   GAP: 0,
 }
 

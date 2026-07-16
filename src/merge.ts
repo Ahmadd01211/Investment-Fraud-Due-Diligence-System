@@ -227,11 +227,21 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
     : String(clean.find((e) => e.not_relevant_reason)?.not_relevant_reason || '') ||
       'This does not appear to be an investment offering, pitch, or solicitation.'
 
-  // Dispositive rules: a single Tier 1 hit on any of these is independently
-  // conclusive — floor the score at Critical (75) regardless of breadth.
+  // Dispositive rules: barred promoter, false FDIC / regulatory claim,
+  // "guaranteed / risk-free" returns, nominee concealment. A single one of these
+  // is independently conclusive of fraud, so it floors the score at Critical (75).
+  //
+  // We accept Tier 1 (documentary) OR Tier 2/Tier 3 evidence — NOT just Tier 1.
+  // The most dangerous claims almost always appear as the promoter's OWN marketing
+  // language (ads, landing pages, emails), which the tier rubric classifies as
+  // "Tier 2" at best and NEVER "Tier 1" (that tier is reserved for a PPM / Form D /
+  // FINRA record). Gating on Tier 1 alone made this override dead code for the most
+  // common upload types — a "guaranteed 16% risk-free" website would slip through
+  // as Low. `triggered` already requires a concrete verbatim quote above the
+  // confidence floor, so rank >= Tier 3 is real evidence, not pure inference (Tier 4).
   const DISPOSITIVE_RULES = new Set([4, 5, 6, 8])
   const hasDispositiveHit = triggered.some(
-    (f) => DISPOSITIVE_RULES.has(f.n) && f.evidenceTier === 'Tier 1'
+    (f) => DISPOSITIVE_RULES.has(f.n) && (TIER_RANK[f.evidenceTier] ?? 0) >= 2
   )
 
   // If the material is not investment-related, force a neutral risk output.
