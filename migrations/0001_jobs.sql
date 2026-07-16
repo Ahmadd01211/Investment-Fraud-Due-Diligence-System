@@ -11,7 +11,7 @@
 CREATE TABLE IF NOT EXISTS jobs (
   id                TEXT PRIMARY KEY,               -- Job ID (returned to client)
   status            TEXT NOT NULL DEFAULT 'pending',-- pending|extracting|analyzing|merging|reporting|done|error|not_relevant
-  provider          TEXT,                           -- kimi | openai
+  provider          TEXT,                           -- deepseek | openai
   total_chunks      INTEGER NOT NULL DEFAULT 0,
   done_chunks       INTEGER NOT NULL DEFAULT 0,
   -- structured intake context (json)

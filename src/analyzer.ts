@@ -5,7 +5,8 @@
 //
 //  PIPELINE (never truncates, never scores in the LLM):
 //    1. chunking.ts   → semantic, page-aware chunks (headings/clauses/tables).
-//    2. providers.ts  → Kimi (primary) or OpenAI (fallback), strongest model.
+//    2. providers.ts  → DeepSeek (primary text reasoning) or OpenAI (fallback);
+//                       OpenAI vision handles OCR (DeepSeek is text-only).
 //    3. rules.ts      → each chunk evaluated against ALL 21 rules; the LLM
 //                       returns deterministic per-chunk JSON (triggered,
 //                       confidence, tier, evidence[page/quote/reason]) ONLY.
@@ -21,12 +22,14 @@
 // ════════════════════════════════════════════════════════════════
 
 import {
-  selectProvider,
+  selectReasoningProvider,
   selectOcrProvider,
   hasProvider,
+  hasVisionProvider,
   type AIProvider,
   type ProviderEnv,
 } from './providers'
+import { maxPageMarker, ocrPagesToMarkedText, mergeTextSources } from './textmerge'
 import {
   FLAG_FRAMEWORK,
   RULE_BY_N,
@@ -36,7 +39,6 @@ import {
   type RuleFinding,
 } from './rules'
 import {
-  stripPageMarkers,
   type Chunk,
 } from './chunking'
 import { mergeEvaluations, type MergedDataset, type MergedFinding } from './merge'
@@ -47,15 +49,69 @@ export { FLAG_FRAMEWORK }
 export type Bindings = ProviderEnv & {
   // ── Chunk sizing (TPM-driven; future-proof) ──
   OPENAI_TPM?: string
-  KIMI_TPM?: string
   MAX_CHUNK_CHARS?: string
   MIN_CHUNK_CHARS?: string
   SKIP_BOILERPLATE?: string
+
+  // ── Optional accounts (Feature B) ──
+  SESSION_SECRET?: string
+  GOOGLE_CLIENT_ID?: string
+  GOOGLE_CLIENT_SECRET?: string
+  GOOGLE_REDIRECT_URI?: string
+  APP_BASE_URL?: string
 
   // ── Async job storage bindings (optional; present after hosted deploy) ──
   DB?: any     // D1Database — jobs / chunks / findings
   R2?: any     // R2Bucket — raw uploads + extracted text
   KV?: any     // KVNamespace — premium requests (existing)
+}
+
+// ════════════════════════════════════════════════════════════════
+//  MATERIAL PREPARATION  (OCR via OpenAI → merge/de-dupe → clean TEXT)
+//
+//  DeepSeek (reasoning) only ever receives TEXT. Any attached images or
+//  scanned pages are OCR'd by OpenAI vision here, then merged and
+//  de-duplicated with the pasted/PDF/DOCX text into one authoritative string.
+// ════════════════════════════════════════════════════════════════
+
+const MAX_OCR_IMAGES = 120
+
+/** OCR image data-URLs into marked page text (OpenAI vision). Best-effort → ''. */
+export async function ocrImagesToText(env: Bindings, images: string[], pastedText = ''): Promise<string> {
+  const imgs = (images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, MAX_OCR_IMAGES)
+  if (imgs.length === 0) return ''
+  const ocr = selectOcrProvider(env)
+  if (!ocr) return ''
+  try {
+    const startPage = maxPageMarker(pastedText) + 1
+    const pages = await ocr.extract(imgs, startPage)
+    return ocrPagesToMarkedText(pages)
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Produce the single clean TEXT to analyze from raw pasted text + images.
+ * - No images → the trimmed pasted text.
+ * - Images → OCR them (OpenAI) and merge/de-dupe with the pasted text.
+ *   • merged non-empty → return it.
+ *   • merged empty AND no OCR provider → throw SERVICE_CONFIG.
+ *   • merged empty WITH an OCR provider → throw IMAGES_NO_TEXT.
+ */
+export async function prepareMaterial(env: Bindings, rawMaterial: string, images?: string[]): Promise<string> {
+  const pasted = String(rawMaterial || '').trim()
+  const imgs = (images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, MAX_OCR_IMAGES)
+  if (imgs.length === 0) return pasted
+
+  const ocrText = await ocrImagesToText(env, imgs, pasted)
+  const { text } = mergeTextSources(pasted, ocrText)
+  if (text.trim().length > 0) return text.trim()
+
+  if (!hasVisionProvider(env)) {
+    throw new Error('SERVICE_CONFIG: image-only submission but no OCR provider configured (set OPENAI_API_KEY)')
+  }
+  throw new Error('IMAGES_NO_TEXT: no readable text extracted from image(s)')
 }
 
 function clamp(v: number, lo: number, hi: number) {
@@ -185,29 +241,25 @@ function normalizeChunkEval(raw: any, chunk: Chunk): ChunkEvaluation {
 export async function evaluateChunk(
   provider: AIProvider,
   chunk: Chunk,
-  ctx: string[],
-  images: string[] = []
+  ctx: string[]
 ): Promise<ChunkEvaluation> {
-  const hasImages = images.length > 0
-  const cleanText = stripPageMarkers(chunk.text)
   const pageNote = chunk.startPage
     ? `This chunk spans pages ${chunk.startPage}–${chunk.endPage}. The text below preserves [[PAGE n]] markers; cite the page each quote appears on.`
     : 'Page numbers are not available; use page 0 in evidence.'
 
-  const textPart =
+  // TEXT-ONLY: any attached images/scanned pages were already OCR'd into this
+  // text upstream (prepareMaterial). The reasoning model never receives images.
+  const userContent =
     (ctx.length ? `INVESTOR-PROVIDED CONTEXT:\n${ctx.join('\n')}\n\n` : '') +
     (chunk.headings.length ? `SECTION(S) IN THIS CHUNK: ${chunk.headings.join(' | ')}\n\n` : '') +
     `CHUNK ID: ${chunk.chunk_id}\n${pageNote}\n\n` +
+    `NOTE: Any images or scanned pages the investor attached have already been ` +
+    `transcribed (OCR) into the text below; evaluate the text as-is.\n\n` +
     `MATERIAL TO EVALUATE:\n"""\n${chunk.text}\n"""\n\n` +
-    (hasImages ? `The investor also attached ${images.length} image(s); read all text/claims in them too.\n\n` : '') +
     `Evaluate ALL 21 rules against this chunk and return the JSON object only.`
 
-  const userContent = hasImages
-    ? [{ type: 'text', text: textPart }, ...images.map((url) => ({ type: 'image_url', image_url: { url } }))]
-    : textPart
-
   const res = await provider.chatJson({
-    role: hasImages ? 'vision' : 'reason',
+    role: 'reason',
     systemPrompt: CHUNK_EVAL_PROMPT(),
     userContent,
   })
@@ -268,7 +320,7 @@ export async function generateReport(provider: AIProvider, merged: MergedDataset
       userContent: `FINAL ANALYSIS DATASET (already scored by the application — do not change scores):\n${JSON.stringify(
         reportInputFor(merged)
       )}`,
-      maxTokens: 4000,
+      // No maxTokens override → the reason role gets its larger default budget.
     })
     const raw = safeParseJson(res.content, res.finishReason)
     return {
@@ -337,39 +389,21 @@ export function assembleResult(merged: MergedDataset, report: FinalReport) {
 
 export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
   if (!hasProvider(env)) {
-    throw new Error('SERVICE_AUTH: Analysis service is not configured. Set KIMI_API_KEY (primary) or OPENAI_API_KEY (fallback).')
+    throw new Error('SERVICE_AUTH: Analysis service is not configured. Set DEEPSEEK_API_KEY (primary) or OPENAI_API_KEY (fallback).')
   }
-  const provider = selectProvider(env)
+  const provider = selectReasoningProvider(env)
   const ctx = buildCtx(input)
-  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 10)
+  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, MAX_OCR_IMAGES)
   const rawMaterial = (input.material || '').trim()
 
-  // OCR: if only images (or images + little text), transcribe them into text
-  // with page numbers preserved, then chunk+evaluate the combined text.
-  let material = rawMaterial
-  if (images.length > 0 && rawMaterial.length < 200) {
-    try {
-      const ocr = selectOcrProvider(env)
-      const pages = await ocr.extract(images)
-      const ocrText = pages.map((p) => `[[PAGE ${p.page}]]\n${p.text}`).join('\n\n')
-      material = (rawMaterial + '\n\n' + ocrText).trim()
-    } catch {
-      // OCR is best-effort; fall through to vision evaluation of the images.
-    }
-  }
+  // OCR images (OpenAI) + merge/de-dupe with pasted text → one clean TEXT.
+  // DeepSeek only ever receives text.
+  const material = await prepareMaterial(env, rawMaterial, images)
 
   const chunks = buildChunks(env, material)
   const evals: ChunkEvaluation[] = []
-
-  if (chunks.length === 0) {
-    // Pure-image submission (no extractable text): evaluate the image directly.
-    const imgChunk: Chunk = { chunk_id: 0, text: '(image submission)', startPage: 1, endPage: 1, headings: [] }
-    evals.push(await evaluateChunk(provider, imgChunk, ctx, images))
-  } else {
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkImages = i === 0 ? images : []
-      evals.push(await evaluateChunk(provider, chunks[i], ctx, chunkImages))
-    }
+  for (let i = 0; i < chunks.length; i++) {
+    evals.push(await evaluateChunk(provider, chunks[i], ctx))
   }
 
   const merged = mergeEvaluations(evals)
@@ -405,17 +439,23 @@ export async function analyzeChunkRequest(env: Bindings, input: ChunkRequestInpu
   if (!hasProvider(env)) {
     throw new Error('SERVICE_AUTH: Analysis service is not configured.')
   }
-  const provider = selectProvider(env)
+  const provider = selectReasoningProvider(env)
   const ctx = buildCtx(input)
-  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 10)
+  // If this browser-driven chunk carries images (no-D1 fallback path), OCR them
+  // (OpenAI) and merge into the chunk text so the reasoning model only sees text.
+  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, MAX_OCR_IMAGES)
+  let chunkText = String(input.chunk || '')
+  if (images.length > 0) {
+    chunkText = await prepareMaterial(env, chunkText, images)
+  }
   const chunk: Chunk = {
     chunk_id: Number(input.chunkIndex) || 0,
-    text: String(input.chunk || ''),
+    text: chunkText,
     startPage: Number(input.startPage) || 0,
     endPage: Number(input.endPage) || 0,
     headings: Array.isArray(input.headings) ? input.headings : [],
   }
-  return evaluateChunk(provider, chunk, ctx, images)
+  return evaluateChunk(provider, chunk, ctx)
 }
 
 /** Merge per-chunk ChunkEvaluations into the final scored + reported result. */
@@ -426,7 +466,7 @@ export async function mergeChunkAnalysis(env: Bindings, results: any[]): Promise
   if (!merged.isInvestmentRelated) {
     throw new Error('NOT_RELEVANT:' + merged.notRelevantReason)
   }
-  const provider = hasProvider(env) ? selectProvider(env) : null
+  const provider = hasProvider(env) ? selectReasoningProvider(env) : null
   const report = provider ? await generateReport(provider, merged) : { ...FALLBACK_REPORT }
   return assembleResult(merged, report)
 }

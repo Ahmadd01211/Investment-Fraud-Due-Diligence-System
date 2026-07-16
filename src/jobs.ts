@@ -28,10 +28,11 @@ import {
   mergeOnly,
   generateReport,
   assembleResult,
+  prepareMaterial,
   type Bindings,
   type Chunk,
 } from './analyzer'
-import { selectProvider, selectOcrProvider, hasProvider } from './providers'
+import { selectReasoningProvider, hasProvider } from './providers'
 import type { ChunkEvaluation } from './rules'
 
 export function jobsAvailable(env: Bindings): boolean {
@@ -46,11 +47,22 @@ let schemaReady = false
 async function ensureSchema(env: Bindings): Promise<void> {
   if (schemaReady) return
   await env.DB.exec(
-    'CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT \'pending\', provider TEXT, total_chunks INTEGER NOT NULL DEFAULT 0, done_chunks INTEGER NOT NULL DEFAULT 0, context_json TEXT, raw_key TEXT, text_key TEXT, result_json TEXT, error_message TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)'
+    'CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT \'pending\', provider TEXT, user_id TEXT, total_chunks INTEGER NOT NULL DEFAULT 0, done_chunks INTEGER NOT NULL DEFAULT 0, context_json TEXT, raw_key TEXT, text_key TEXT, result_json TEXT, error_message TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)'
   )
   await env.DB.exec(
     'CREATE TABLE IF NOT EXISTS job_chunks (job_id TEXT NOT NULL, chunk_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT \'pending\', start_page INTEGER NOT NULL DEFAULT 0, end_page INTEGER NOT NULL DEFAULT 0, headings TEXT, text_inline TEXT, eval_json TEXT, error_message TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY (job_id, chunk_id))'
   )
+  // Guarded add for DBs created before user_id existed (idempotent).
+  try {
+    await env.DB.exec('ALTER TABLE jobs ADD COLUMN user_id TEXT')
+  } catch {
+    /* column already exists */
+  }
+  try {
+    await env.DB.exec('CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id, created_at)')
+  } catch {
+    /* index optional */
+  }
   schemaReady = true
 }
 
@@ -71,6 +83,7 @@ export interface CreateJobInput {
   claimedReturn?: string
   amountAsked?: string
   sourceType?: string
+  userId?: string
 }
 
 // ── Create a job: single-pass row, persist id, return immediately ──
@@ -80,34 +93,22 @@ export async function createJob(env: Bindings, input: CreateJobInput): Promise<{
   const jobId = newJobId()
   const ts = now()
 
-  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 10)
-  let material = (input.material || '').trim()
+  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 120)
+  const rawMaterial = (input.material || '').trim()
 
-  // OCR up front (images with little text) so chunks include transcribed pages.
-  if (images.length > 0 && material.length < 200) {
-    try {
-      const ocr = selectOcrProvider(env)
-      const pages = await ocr.extract(images)
-      const ocrText = pages.map((p) => `[[PAGE ${p.page}]]\n${p.text}`).join('\n\n')
-      material = (material + '\n\n' + ocrText).trim()
-    } catch {
-      /* best-effort */
-    }
-  }
+  // OCR images (OpenAI) + merge/de-dupe with pasted text UP FRONT so every
+  // chunk is pure text. DeepSeek (reasoning) never receives images.
+  const material = await prepareMaterial(env, rawMaterial, images)
 
-  const chunks: Chunk[] = material ? buildChunks(env, material) : []
-  // Pure-image fallback chunk.
-  if (chunks.length === 0) {
-    chunks.push({ chunk_id: 0, text: '(image submission)', startPage: 1, endPage: 1, headings: [] })
-  }
+  const chunks: Chunk[] = buildChunks(env, material)
 
+  // Images are already OCR'd into the text; nothing image-related is persisted.
   const context = {
     sponsorName: input.sponsorName,
     assetType: input.assetType,
     claimedReturn: input.claimedReturn,
     amountAsked: input.amountAsked,
     sourceType: input.sourceType,
-    images, // first-chunk images only (kept small; 4 max)
   }
 
   // Store the full extracted text in R2 (avoids bloating D1); chunks store inline.
@@ -120,11 +121,13 @@ export async function createJob(env: Bindings, input: CreateJobInput): Promise<{
     }
   }
 
+  const userId = input.userId ? String(input.userId) : null
+
   await env.DB.prepare(
-    `INSERT INTO jobs (id, status, total_chunks, done_chunks, context_json, text_key, created_at, updated_at)
-     VALUES (?, 'analyzing', ?, 0, ?, ?, ?, ?)`
+    `INSERT INTO jobs (id, status, user_id, total_chunks, done_chunks, context_json, text_key, created_at, updated_at)
+     VALUES (?, 'analyzing', ?, ?, 0, ?, ?, ?, ?)`
   )
-    .bind(jobId, chunks.length, JSON.stringify(context), textKey, ts, ts)
+    .bind(jobId, userId, chunks.length, JSON.stringify(context), textKey, ts, ts)
     .run()
 
   // Persist chunk rows. Chunk text stored inline (D1 row); large enough for our chunks.
@@ -223,7 +226,7 @@ export async function processNextUnit(env: Bindings, jobId: string): Promise<Tic
     await touchJob(env, jobId, { status: 'error', error_message: 'Analysis service is not configured.' })
     return mkResult({ status: 'error', finished: true, error: 'Analysis service is not configured.' })
   }
-  const provider = selectProvider(env)
+  const provider = selectReasoningProvider(env)
   const context = job.context_json ? JSON.parse(job.context_json) : {}
   const ctx: string[] = []
   if (context.sponsorName) ctx.push(`Sponsor / promoter name: ${context.sponsorName}`)
@@ -247,11 +250,9 @@ export async function processNextUnit(env: Bindings, jobId: string): Promise<Tic
       endPage: Number(nextChunk.end_page) || 0,
       headings: nextChunk.headings ? JSON.parse(nextChunk.headings) : [],
     }
-    // Only the first chunk carries the images (single vision pass).
-    const images = chunk.chunk_id === 0 && Array.isArray(context.images) ? context.images : []
-
     try {
-      const evalResult: ChunkEvaluation = await evaluateChunk(provider, chunk, ctx, images)
+      // Images were OCR'd into the chunk text at job creation; text-only here.
+      const evalResult: ChunkEvaluation = await evaluateChunk(provider, chunk, ctx)
       await env.DB.prepare(
         `UPDATE job_chunks SET status = 'done', eval_json = ?, updated_at = ? WHERE job_id = ? AND chunk_id = ?`
       )
@@ -331,5 +332,53 @@ export async function processJobToCompletion(env: Bindings, jobId: string, maxSt
     } else {
       await sleep(250)
     }
+  }
+}
+
+// ── Saved history for a signed-in user (Feature B) ──
+export interface UserJobSummary {
+  jobId: string
+  status: string
+  createdAt: number
+  riskScore: number | null
+  riskLevel: string | null
+  verdict: string | null
+}
+
+/** Newest-first summaries of a user's jobs (parsed from result_json). */
+export async function getUserJobs(env: Bindings, userId: string, limit = 20): Promise<UserJobSummary[]> {
+  if (!jobsAvailable(env) || !userId) return []
+  try {
+    await ensureSchema(env)
+    const rows: any = await env.DB.prepare(
+      `SELECT id, status, result_json, created_at FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`
+    )
+      .bind(userId, Math.max(1, Math.min(100, limit)))
+      .all()
+    return (rows?.results || []).map((r: any) => {
+      let riskScore: number | null = null
+      let riskLevel: string | null = null
+      let verdict: string | null = null
+      if (r.result_json) {
+        try {
+          const res = JSON.parse(r.result_json)
+          if (typeof res?.riskScore === 'number') riskScore = res.riskScore
+          if (res?.riskLevel) riskLevel = String(res.riskLevel)
+          if (res?.verdict) verdict = String(res.verdict)
+        } catch {
+          /* ignore malformed */
+        }
+      }
+      return {
+        jobId: String(r.id),
+        status: String(r.status),
+        createdAt: Number(r.created_at) || 0,
+        riskScore,
+        riskLevel,
+        verdict,
+      }
+    })
+  } catch {
+    return []
   }
 }

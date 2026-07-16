@@ -261,6 +261,7 @@ Example: 'Earn a GUARANTEED 22% annual return with our real-estate fund. Feature
 </footer>
 
 <script src="/static/app.js"></script>
+<script src="/static/auth.js"></script>
 </body>
 </html>`
 }

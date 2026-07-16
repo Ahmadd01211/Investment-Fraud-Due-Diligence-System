@@ -542,6 +542,7 @@ export function SolutionsPage(): string {
   }
 })();
 </script>
+<script src="/static/auth.js"></script>
 </body>
 </html>`
 }

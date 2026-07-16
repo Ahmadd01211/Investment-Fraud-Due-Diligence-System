@@ -269,15 +269,57 @@
     const buf = await readAsArrayBuffer(file);
     const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
 
-    const pageCount = Math.min(pdf.numPages, MAX_IMAGES - attachedImages.length);
+    // Cap the number of pages we may attach as images (only image-only pages
+    // get rendered). Text pages cost nothing image-wise, so scan every page.
+    const pageCount = pdf.numPages;
+    const imageBudget = Math.max(0, MAX_IMAGES - attachedImages.length);
     const images = [];
     const pageTextBlocks = [];
     let textPages = 0;
+    let ocrPages = 0;
 
     for (let i = 1; i <= pageCount; i++) {
       const page = await pdf.getPage(i);
 
-      // 1) Render page image for vision pipeline.
+      // 1) TEXT FIRST — extract this page's selectable text.
+      const content = await page.getTextContent();
+      const tokens = (content.items || [])
+        .map((it) => ({
+          str: String(it.str || ''),
+          x: Number(it.transform?.[4]) || 0,
+          y: Number(it.transform?.[5]) || 0,
+          w: Number(it.width) || 0,
+        }))
+        .filter((it) => it.str.trim().length > 0);
+
+      let pageText = '';
+      if (tokens.length) {
+        // Group tokens by visual text lines.
+        const lineBuckets = [];
+        const Y_TOL = 3;
+        for (const tk of tokens) {
+          let bucket = lineBuckets.find((b) => Math.abs(b.y - tk.y) <= Y_TOL);
+          if (!bucket) {
+            bucket = { y: tk.y, items: [] };
+            lineBuckets.push(bucket);
+          }
+          bucket.items.push(tk);
+        }
+        // PDF y-axis is bottom-up; read top-to-bottom by descending y.
+        lineBuckets.sort((a, b) => b.y - a.y);
+        const lines = lineBuckets.map((b) => mergeLineItems(b.items)).filter(Boolean);
+        pageText = lines.join('\n').trim();
+      }
+
+      if (pageText.length >= 40) {
+        // Real text layer → keep the exact text; DO NOT render/attach an image.
+        textPages += 1;
+        pageTextBlocks.push(`[[PAGE ${i}]]\n${pageText}`);
+        continue;
+      }
+
+      // 2) Image-only / scanned page → render it so OpenAI can OCR it (server-side).
+      if (images.length >= imageBudget) continue;
       const viewport = page.getViewport({ scale: 1.4 });
       const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d');
@@ -289,47 +331,14 @@
         name: `${file.name || 'pdf'} - page ${i}`,
         dataUrl: canvas.toDataURL('image/jpeg', 0.88),
       });
-
-      // 2) Gracefully extract selectable text.
-      const content = await page.getTextContent();
-      const tokens = (content.items || [])
-        .map((it) => ({
-          str: String(it.str || ''),
-          x: Number(it.transform?.[4]) || 0,
-          y: Number(it.transform?.[5]) || 0,
-          w: Number(it.width) || 0,
-        }))
-        .filter((it) => it.str.trim().length > 0);
-
-      if (!tokens.length) continue;
-
-      // Group tokens by visual text lines.
-      const lineBuckets = [];
-      const Y_TOL = 3;
-      for (const tk of tokens) {
-        let bucket = lineBuckets.find((b) => Math.abs(b.y - tk.y) <= Y_TOL);
-        if (!bucket) {
-          bucket = { y: tk.y, items: [] };
-          lineBuckets.push(bucket);
-        }
-        bucket.items.push(tk);
-      }
-
-      // PDF y-axis is bottom-up; read top-to-bottom by descending y.
-      lineBuckets.sort((a, b) => b.y - a.y);
-      const lines = lineBuckets.map((b) => mergeLineItems(b.items)).filter(Boolean);
-      const pageText = lines.join('\n').trim();
-
-      if (pageText.length >= 40) {
-        textPages += 1;
-        pageTextBlocks.push(`[[PAGE ${i}]]\n${pageText}`);
-      }
+      ocrPages += 1;
     }
 
     return {
       images,
       totalPages: pdf.numPages,
-      renderedPages: pageCount,
+      textPages,
+      ocrPages,
       extractedText: pageTextBlocks.join('\n\n').trim(),
       hasReadableText: textPages > 0,
     };
@@ -380,23 +389,31 @@
           toast(`Attached image "${file.name}"`, 'ok');
         } else if (kind === 'pdf') {
           toast(`Processing PDF "${file.name}"…`, 'ok');
-          const { images, totalPages, renderedPages, extractedText, hasReadableText } = await extractPdfPayload(file);
-          if (!images.length) {
-            toast(`Could not extract pages from "${file.name}".`, 'err');
-          } else {
+          const { images, totalPages, textPages, ocrPages, extractedText, hasReadableText } = await extractPdfPayload(file);
+
+          // Text pages contribute clean text; image-only pages are attached for
+          // server-side OCR. Success = we got EITHER text OR images.
+          if (hasReadableText && extractedText) {
+            appendToMaterial(extractedText, `${file.name} (extracted text)`);
+          }
+          if (images.length) {
             attachedImages.push(...images);
             renderAttachList();
+          }
 
-            if (hasReadableText && extractedText) {
-              appendToMaterial(extractedText, `${file.name} (extracted text)`);
-              toast(`Attached ${renderedPages} page images and added clean extracted text from "${file.name}".`, 'ok');
-            } else {
-              toast(`Attached ${renderedPages} page images from "${file.name}" (image-only PDF).`, 'ok');
-            }
+          if (!extractedText && !images.length) {
+            toast(`Could not read any text or pages from "${file.name}".`, 'err');
+          } else if (extractedText && images.length) {
+            toast(`Added text from ${textPages} page(s) and attached ${ocrPages} scanned page(s) from "${file.name}".`, 'ok');
+          } else if (extractedText) {
+            toast(`Added clean text from ${textPages} page(s) of "${file.name}".`, 'ok');
+          } else {
+            toast(`Attached ${ocrPages} scanned page(s) from "${file.name}" (image-only PDF).`, 'ok');
+          }
 
-            if (totalPages > renderedPages) {
-              toast(`Only ${renderedPages} of ${totalPages} pages were attached (image limit reached).`, 'err');
-            }
+          const covered = textPages + ocrPages;
+          if (totalPages > covered) {
+            toast(`Only ${covered} of ${totalPages} pages were processed (image attachment limit reached).`, 'err');
           }
         } else if (kind === 'docx') {
           toast(`Reading Word doc "${file.name}"…`, 'ok');
@@ -581,22 +598,50 @@
     return rdata.result;
   }
 
-  /* ── IMAGE-BATCH PIPELINE: send PDF pages/images in loops of 10 ── */
-  async function runImageBatchPipeline(images, meta, handleErr) {
+  /* ── IMAGE-BATCH PIPELINE (no-D1 fallback): pasted text + image loops of 10 ──
+     The server OCRs each image batch into text before evaluating it. The pasted
+     text is sent as its own leading text-only chunk so it is never dropped. */
+  async function runImageBatchPipeline(text, images, meta, handleErr) {
     clearInterval(msgTimer);
-    const totalBatches = Math.ceil(images.length / IMAGE_BATCH_SIZE);
+    const imageBatches = Math.ceil(images.length / IMAGE_BATCH_SIZE);
+    const hasText = String(text || '').trim().length > 0;
+    const totalChunks = imageBatches + (hasText ? 1 : 0);
     const results = [];
+    let chunkIndex = 0;
 
-    for (let i = 0; i < totalBatches; i++) {
+    // Leading text-only chunk (pasted / PDF-extracted text).
+    if (hasText) {
+      loadingMsg.textContent = 'Analyzing pasted text…';
+      const res = await fetch('/api/analyze-chunk', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chunk: text,
+          chunkIndex: chunkIndex,
+          totalChunks,
+          startPage: 0,
+          endPage: 0,
+          headings: [],
+          images: [],
+          ...meta,
+        }),
+      });
+      const data = await res.json();
+      if (handleErr(data, res)) return null;
+      if (data && data.result) results.push(data.result);
+      chunkIndex += 1;
+      await sleep(250);
+    }
+
+    for (let i = 0; i < imageBatches; i++) {
       const batch = images.slice(i * IMAGE_BATCH_SIZE, (i + 1) * IMAGE_BATCH_SIZE);
-      loadingMsg.textContent = `Analyzing image batch ${i + 1} of ${totalBatches}…`;
+      loadingMsg.textContent = `Analyzing image batch ${i + 1} of ${imageBatches}…`;
 
       const res = await fetch('/api/analyze-chunk', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          chunk: `(image batch ${i + 1}/${totalBatches})`,
-          chunkIndex: i,
-          totalChunks: totalBatches,
+          chunk: `(scanned pages ${i * IMAGE_BATCH_SIZE + 1}–${i * IMAGE_BATCH_SIZE + batch.length})`,
+          chunkIndex: chunkIndex,
+          totalChunks,
           startPage: i * IMAGE_BATCH_SIZE + 1,
           endPage: i * IMAGE_BATCH_SIZE + batch.length,
           headings: [],
@@ -607,11 +652,12 @@
       const data = await res.json();
       if (handleErr(data, res)) return null;
       if (data && data.result) results.push(data.result);
+      chunkIndex += 1;
       await sleep(250);
     }
 
     if (!results.length) {
-      throw new Error('No image batches were analyzed. Please retry.');
+      throw new Error('No content could be analyzed. Please retry.');
     }
 
     loadingMsg.textContent = 'Combining findings into your final report…';
@@ -771,13 +817,15 @@
       } catch { /* assume unavailable */ }
 
       let result;
-      if (images.length > IMAGE_BATCH_SIZE) {
-        // For large PDF/image submissions, send in loops of 10 images per request.
-        result = await runImageBatchPipeline(images, meta, handleErr);
-        if (result === null) return;
-      } else if (asyncJobs) {
+      if (asyncJobs) {
+        // Preferred path: the server OCRs images + merges text up front and
+        // handles any size, so ALWAYS use it when D1/R2 are available.
         result = await runAsyncJob(text, images, meta, handleErr);
         if (result === null) return; // handled (e.g. not-an-investment notice)
+      } else if (images.length > IMAGE_BATCH_SIZE) {
+        // No-D1 fallback for large image sets: batch images (and send pasted text).
+        result = await runImageBatchPipeline(text, images, meta, handleErr);
+        if (result === null) return;
       } else {
         result = await runBrowserPipeline(text, images, meta, handleErr);
         if (result === null) return;
@@ -975,7 +1023,7 @@
     { q: 'Do I need an account, API key, or any setup?', a: 'No. Nothing to install, no sign-up, and no API keys. Just paste the investment material and click Analyze — the AI runs entirely on our servers.' },
     { q: 'Is it really free?', a: 'Yes, you can run fraud checks for free. It is designed for everyday investors who want a second opinion before risking their savings.' },
     { q: 'What can I paste in?', a: 'Anything a promoter sent you: a Facebook or Instagram ad, an email, a text/WhatsApp message, a webinar transcript, a website\'s pitch, or the text from a pitch deck / PPM document. You can also drag-and-drop a .txt file.' },
-    { q: 'Do you store my documents?', a: 'No. Your text is sent securely to the analysis engine to produce your report and is not saved on our servers. For sensitive documents, you can remove names before pasting.' },
+    { q: 'Do you store my documents?', a: 'If you are NOT signed in, no — your text is sent securely to the analysis engine to produce your report and is processed transiently, not saved to your account. If you ARE signed in, your checks are saved to your account history so you can revisit them later. Either way, for sensitive documents you can remove names before pasting.' },
     { q: 'How accurate is it?', a: 'The engine checks the language and structure of the pitch against 21 fraud patterns drawn from real SEC enforcement cases. It is a powerful early-warning tool — but it is not legal or financial advice. Always confirm with primary sources (SEC EDGAR, FINRA BrokerCheck, county records) and a licensed professional.' },
     { q: 'It flagged a real, legitimate investment. Why?', a: 'Some legitimate offerings use aggressive marketing language that overlaps with fraud patterns. A flag means "verify this," not "this is definitely fraud." Use the "What to do next" steps to confirm.' },
   ];
@@ -986,4 +1034,41 @@
     </details>`).join('');
 
   tagReveal();
+
+  /* ── /?job=<id> deep-link loader (powers history "View") ── */
+  (async function loadJobFromUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const jobId = params.get('job');
+    if (!jobId) return;
+
+    // Clean the ?job= param from the URL (keep other params + hash).
+    params.delete('job');
+    const qs = params.toString();
+    const clean = window.location.pathname + (qs ? '?' + qs : '') + window.location.hash;
+    window.history.replaceState({}, '', clean);
+
+    try {
+      showState('loading');
+      loadingMsg.textContent = 'Loading your saved report…';
+      document.getElementById('analyze').scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+      const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/result`);
+      const data = await res.json().catch(() => ({}));
+      const result = data && data.result;
+
+      if (res.ok && result && typeof result.riskScore === 'number') {
+        renderResult(result);
+        showState('content');
+        toast('Loaded your saved report.', 'ok');
+      } else {
+        showState('empty');
+        showNotice('Report not available yet',
+          'This saved check is still processing or its report could not be found. Please try again shortly, or run a new analysis.');
+        toast('That report is not available yet.', 'err');
+      }
+    } catch {
+      showState('empty');
+      toast('Could not load that saved report.', 'err');
+    }
+  })();
 })();

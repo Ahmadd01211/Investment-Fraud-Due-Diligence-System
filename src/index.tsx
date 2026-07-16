@@ -9,13 +9,38 @@ import {
   FLAG_FRAMEWORK,
   type Bindings,
 } from './analyzer'
-import { createJob, getJobStatus, getJobResult, processNextUnit, processJobToCompletion, jobsAvailable } from './jobs'
+import { createJob, getJobStatus, getJobResult, processNextUnit, processJobToCompletion, jobsAvailable, getUserJobs } from './jobs'
 import { HomePage } from './page'
 import { PremiumPage } from './premium'
+import {
+  authAvailable,
+  getSessionTokenFromRequest,
+  getSessionUser,
+  registerUser,
+  loginUser,
+  createSession,
+  destroySession,
+  sessionCookie,
+  clearSessionCookie,
+  googleEnabled,
+  googleAuthUrl,
+  verifyGoogleState,
+  clearGoogleStateCookie,
+  exchangeGoogleCode,
+  upsertGoogleUser,
+  type AuthUser,
+} from './auth'
 
 const app = new Hono<{ Bindings: Bindings }>()
 
 app.use('/api/*', cors())
+
+// Resolve the signed-in user from the session cookie (null if auth/D1 absent).
+async function currentUser(c: any): Promise<AuthUser | null> {
+  if (!authAvailable(c.env)) return null
+  const token = getSessionTokenFromRequest(c.req.header('Cookie'))
+  return getSessionUser(c.env, token)
+}
 
 // Map an analyzer error to a friendly {status, body} pair.
 function mapAnalyzeError(err: any): { status: number; body: any } {
@@ -45,6 +70,27 @@ function mapAnalyzeError(err: any): { status: number; body: any } {
   }
   if (raw.startsWith('SERVICE_AUTH:')) {
     return { status: 503, body: { error: 'The analysis service is not configured correctly (server API key issue). Please contact the site owner.' } }
+  }
+  if (raw.startsWith('SERVICE_CONFIG:')) {
+    return {
+      status: 503,
+      body: {
+        error: 'ocr_unavailable',
+        message:
+          'You attached image(s), but text extraction (OCR) is not configured on this deployment. Please paste the text of the offer instead, or ask the site owner to enable OCR.',
+      },
+    }
+  }
+  if (raw.startsWith('IMAGES_NO_TEXT:')) {
+    return {
+      status: 422,
+      body: {
+        error: 'invalid_submission',
+        title: 'No readable text found',
+        message:
+          'We could not read any text from the image(s) you attached. Please upload a clearer screenshot/scan, or paste the text of the offer directly.',
+      },
+    }
   }
   if (raw.startsWith('SERVICE_MESSAGE:')) {
     return { status: 502, body: { error: 'The analysis service returned an unexpected response. Please try again in a moment.' } }
@@ -79,6 +125,7 @@ app.post('/api/jobs', async (c) => {
     return c.json({ error: 'Please paste at least a few sentences — or attach a document/image — so we can analyze it.' }, 400)
   }
   try {
+    const user = await currentUser(c)
     const { jobId, totalChunks } = await createJob(c.env, {
       material,
       images,
@@ -87,6 +134,7 @@ app.post('/api/jobs', async (c) => {
       claimedReturn: body?.claimedReturn,
       amountAsked: body?.amountAsked,
       sourceType: body?.sourceType,
+      userId: user?.id,
     })
 
     // Background continuation: process the job without requiring the browser to keep ticking.
@@ -336,6 +384,114 @@ app.post('/api/premium-request', async (c) => {
     reference,
     message: 'Request received. Our team will respond within one business day.',
   })
+})
+
+// ════════════════════════════════════════════════════════════════
+//  OPTIONAL ACCOUNTS  (Feature B) — analysis works fully signed-out
+// ════════════════════════════════════════════════════════════════
+
+// Client bootstrap: what auth is available + who is signed in.
+app.get('/api/auth/config', async (c) => {
+  const user = await currentUser(c)
+  return c.json({
+    enabled: authAvailable(c.env),
+    emailPassword: authAvailable(c.env),
+    google: authAvailable(c.env) && googleEnabled(c.env),
+    user: user || null,
+  })
+})
+
+app.get('/api/auth/me', async (c) => {
+  const user = await currentUser(c)
+  return c.json({ user: user || null })
+})
+
+app.post('/api/auth/register', async (c) => {
+  if (!authAvailable(c.env)) {
+    return c.json({ ok: false, error: 'Accounts are not available on this deployment.' }, 501)
+  }
+  let body: any
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ ok: false, error: 'Invalid request.' }, 400)
+  }
+  const res = await registerUser(c.env, body?.email, body?.password, body?.name)
+  if (!res.ok || !res.user) return c.json({ ok: false, error: res.error || 'Could not create account.' }, 400)
+  const token = await createSession(c.env, res.user.id)
+  c.header('Set-Cookie', sessionCookie(token))
+  return c.json({ ok: true, user: res.user })
+})
+
+app.post('/api/auth/login', async (c) => {
+  if (!authAvailable(c.env)) {
+    return c.json({ ok: false, error: 'Accounts are not available on this deployment.' }, 501)
+  }
+  let body: any
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ ok: false, error: 'Invalid request.' }, 400)
+  }
+  const res = await loginUser(c.env, body?.email, body?.password)
+  if (!res.ok || !res.user) return c.json({ ok: false, error: res.error || 'Incorrect email or password.' }, 401)
+  const token = await createSession(c.env, res.user.id)
+  c.header('Set-Cookie', sessionCookie(token))
+  return c.json({ ok: true, user: res.user })
+})
+
+app.post('/api/auth/logout', async (c) => {
+  const token = getSessionTokenFromRequest(c.req.header('Cookie'))
+  await destroySession(c.env, token)
+  c.header('Set-Cookie', clearSessionCookie())
+  return c.json({ ok: true })
+})
+
+app.get('/api/history', async (c) => {
+  const user = await currentUser(c)
+  if (!user) return c.json({ ok: false, error: 'Please sign in to view your history.' }, 401)
+  const items = await getUserJobs(c.env, user.id, 20)
+  return c.json({ ok: true, items })
+})
+
+// ── Google OAuth (authorization-code flow) ──
+app.get('/api/auth/google/start', async (c) => {
+  if (!authAvailable(c.env) || !googleEnabled(c.env)) {
+    return c.json({ error: 'Google sign-in is not configured.' }, 501)
+  }
+  const origin = new URL(c.req.url).origin
+  const { url, stateCookie } = googleAuthUrl(c.env, origin)
+  c.header('Set-Cookie', stateCookie)
+  return c.redirect(url, 302)
+})
+
+app.get('/api/auth/google/callback', async (c) => {
+  if (!authAvailable(c.env) || !googleEnabled(c.env)) {
+    return c.redirect('/?auth=google_failed', 302)
+  }
+  const cookieHeader = c.req.header('Cookie')
+  const errorParam = c.req.query('error')
+  const stateParam = c.req.query('state') || null
+  const code = c.req.query('code') || ''
+
+  // Always clear the state cookie.
+  c.header('Set-Cookie', clearGoogleStateCookie())
+
+  if (errorParam) return c.redirect('/?auth=cancelled', 302)
+  if (!verifyGoogleState(cookieHeader, stateParam)) return c.redirect('/?auth=state_mismatch', 302)
+  if (!code) return c.redirect('/?auth=google_failed', 302)
+
+  try {
+    const origin = new URL(c.req.url).origin
+    const profile = await exchangeGoogleCode(c.env, code, origin)
+    const user = await upsertGoogleUser(c.env, profile)
+    const token = await createSession(c.env, user.id)
+    // Append the session cookie alongside the state-clear cookie.
+    c.header('Set-Cookie', sessionCookie(token), { append: true })
+    return c.redirect('/?auth=signed_in', 302)
+  } catch {
+    return c.redirect('/?auth=google_failed', 302)
+  }
 })
 
 export default app

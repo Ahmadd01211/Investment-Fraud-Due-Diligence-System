@@ -255,6 +255,7 @@ export function PremiumPage(): string {
 
 <script src="/static/pricing.js"></script>
 <script src="/static/premium.js"></script>
+<script src="/static/auth.js"></script>
 </body>
 </html>`
 }
