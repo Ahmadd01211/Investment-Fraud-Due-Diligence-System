@@ -1,18 +1,16 @@
 // ════════════════════════════════════════════════════════════════
-//  ASYNC ANALYSIS JOB PIPELINE  (Queues-equivalent on hosted deploy)
+//  ASYNC ANALYSIS JOB PIPELINE  (persistent job-id + server-side continuation)
 //
-//  Cloudflare Queues + Durable Objects are unavailable on the hosted-deploy
-//  target, so we implement the SAME async pattern with D1 + R2 + a tick
-//  processor driven by frontend polling:
+//  Jobs are persisted in D1 and can continue in the background using
+//  executionCtx.waitUntil() runners. Clients only need jobId polling, so
+//  browser interruptions do not lose the task state.
 //
-//     POST /api/jobs        → store raw+text in R2, create job + chunk rows,
-//                             return { jobId } immediately (no long request).
-//     GET  /api/jobs/:id     → job status + progress (frontend polls this).
-//     POST /api/jobs/:id/tick→ advance the job by ONE unit of work:
-//                                • analyze the next pending chunk, OR
-//                                • run the deterministic merge + report when
-//                                  all chunks are done.
-//     GET  /api/jobs/:id/result → the final assembled result once done.
+//     POST /api/jobs           → create job + return { jobId } immediately,
+//                                 then schedule background processing.
+//     GET  /api/jobs/:id       → status/progress polling (also kicks a runner
+//                                 in waitUntil if job is still active).
+//     POST /api/jobs/:id/tick  → optional manual one-step tick (debug/fallback).
+//     GET  /api/jobs/:id/result→ final assembled result once done.
 //
 //  MIGRATION TO QUEUES LATER = minimal: each "tick" is one queue message.
 //  Replace the frontend-driven tick loop with a queue consumer that calls
@@ -75,14 +73,14 @@ export interface CreateJobInput {
   sourceType?: string
 }
 
-// ── Create a job: chunk now (cheap, CPU-only), persist rows, return id ──
+// ── Create a job: single-pass row, persist id, return immediately ──
 export async function createJob(env: Bindings, input: CreateJobInput): Promise<{ jobId: string; totalChunks: number }> {
   if (!hasProvider(env)) throw new Error('SERVICE_AUTH: Analysis service is not configured.')
   await ensureSchema(env)
   const jobId = newJobId()
   const ts = now()
 
-  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 4)
+  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 10)
   let material = (input.material || '').trim()
 
   // OCR up front (images with little text) so chunks include transcribed pages.
@@ -316,4 +314,22 @@ export async function processNextUnit(env: Bindings, jobId: string): Promise<Tic
 
   await touchJob(env, jobId, { status: 'done', result_json: JSON.stringify(result) })
   return { jobId, status: 'done', doneChunks: total, totalChunks: total, progress: 100, finished: true }
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * Run a persisted job to completion in background-friendly steps.
+ * Safe to call repeatedly: completed/error jobs no-op quickly.
+ */
+export async function processJobToCompletion(env: Bindings, jobId: string, maxSteps = 24): Promise<void> {
+  for (let i = 0; i < maxSteps; i++) {
+    const tick = await processNextUnit(env, jobId)
+    if (tick.finished) return
+    if (tick.retryAfter && tick.retryAfter > 0) {
+      await sleep(Math.max(1000, tick.retryAfter * 1000))
+    } else {
+      await sleep(250)
+    }
+  }
 }

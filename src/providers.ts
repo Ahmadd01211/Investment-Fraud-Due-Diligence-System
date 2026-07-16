@@ -6,10 +6,11 @@
 //  Gemini, …) by implementing AIProvider and registering it in the
 //  selection functions below — nothing else in the pipeline changes.
 //
-//  PROVIDER PRIORITY (per product spec):
-//    1. If a valid Kimi (Moonshot) API key exists → Kimi  (PRIMARY)
-//    2. Else if a valid OpenAI API key exists      → OpenAI (FALLBACK)
-//    3. Else                                       → configuration error
+//  PROVIDER PRIORITY (updated):
+//    1. If a valid DeepSeek API key exists        → DeepSeek Pro v4 (PRIMARY)
+//    2. Else if a valid OpenAI API key exists     → OpenAI GPT-5 (FALLBACK)
+//    3. Else if a valid Kimi API key exists       → Kimi (legacy fallback)
+//    4. Else                                      → configuration error
 //
 //  Reason: structured fraud detection over long investment/legal docs
 //  favours Kimi's long context + lower cost. OpenAI (GPT-4.1) is the
@@ -225,7 +226,7 @@ export interface ProviderEnv {
   KIMI_HELPER_MODEL?: string
   KIMI_REASONING_EFFORT?: string
 
-  // ── OpenAI (FALLBACK) ──
+  // ── OpenAI (PRIMARY) ──
   OPENAI_API_KEY?: string
   OPENAI_BASE_URL?: string
   /** Force ONE OpenAI model for every role. */
@@ -234,6 +235,16 @@ export interface ProviderEnv {
   OPENAI_VISION_MODEL?: string
   OPENAI_HELPER_MODEL?: string
   OPENAI_REASONING_EFFORT?: string
+
+  // ── DeepSeek (fallback) ──
+  DEEPSEEK_API_KEY?: string
+  DEEPSEEK_BASE_URL?: string
+  /** Force ONE DeepSeek model for every role. */
+  DEEPSEEK_MODEL?: string
+  DEEPSEEK_REASON_MODEL?: string
+  DEEPSEEK_VISION_MODEL?: string
+  DEEPSEEK_HELPER_MODEL?: string
+  DEEPSEEK_REASONING_EFFORT?: string
 }
 
 // Defaults.
@@ -246,9 +257,16 @@ const KIMI_DEFAULTS: Record<ModelRole, string> = {
   helper: 'kimi-k2.7',
 }
 const OPENAI_DEFAULTS: Record<ModelRole, string> = {
-  reason: 'gpt-4.1',
-  vision: 'gpt-4.1',
-  helper: 'gpt-4.1-mini', // helper ONLY — never used for rule reasoning
+  // GPT-5 series default; high-context analysis target.
+  reason: 'gpt-5',
+  vision: 'gpt-5',
+  helper: 'gpt-5-mini', // helper ONLY — never used for rule reasoning
+}
+
+const DEEPSEEK_DEFAULTS: Record<ModelRole, string> = {
+  reason: 'deepseek-pro-v4',
+  vision: 'deepseek-pro-v4',
+  helper: 'deepseek-chat',
 }
 
 function isUsableKey(k?: string): boolean {
@@ -283,28 +301,44 @@ function buildOpenAI(env: ProviderEnv): AIProvider {
   })
 }
 
+function buildDeepSeek(env: ProviderEnv): AIProvider {
+  return new OpenAICompatibleProvider('deepseek', {
+    apiKey: env.DEEPSEEK_API_KEY as string,
+    baseUrl: (env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1').replace(/\/$/, ''),
+    reasoningEffort: env.DEEPSEEK_REASONING_EFFORT,
+    forceModel: env.DEEPSEEK_MODEL,
+    models: {
+      reason: env.DEEPSEEK_REASON_MODEL || DEEPSEEK_DEFAULTS.reason,
+      vision: env.DEEPSEEK_VISION_MODEL || DEEPSEEK_DEFAULTS.vision,
+      helper: env.DEEPSEEK_HELPER_MODEL || DEEPSEEK_DEFAULTS.helper,
+    },
+  })
+}
+
 /**
- * Select the active provider per the spec:
- *   valid KIMI_API_KEY → Kimi (PRIMARY);  else valid OPENAI_API_KEY → OpenAI.
+ * Select the active provider per priority:
+ *   DeepSeek Pro v4 → OpenAI (GPT-5) → Kimi.
  * The returned provider is used everywhere; the rest of the app is unchanged.
  */
 export function selectProvider(env: ProviderEnv): AIProvider {
-  if (isUsableKey(env.KIMI_API_KEY)) return buildKimi(env)
+  if (isUsableKey(env.DEEPSEEK_API_KEY)) return buildDeepSeek(env)
   if (isUsableKey(env.OPENAI_API_KEY)) return buildOpenAI(env)
-  throw new Error('SERVICE_AUTH: No analysis provider configured. Set KIMI_API_KEY (primary) or OPENAI_API_KEY (fallback).')
+  if (isUsableKey(env.KIMI_API_KEY)) return buildKimi(env)
+  throw new Error('SERVICE_AUTH: No analysis provider configured. Set DEEPSEEK_API_KEY (primary), OPENAI_API_KEY (fallback), or KIMI_API_KEY.')
 }
 
 /** List every configured provider in priority order (for future runtime fallback). */
 export function availableProviders(env: ProviderEnv): AIProvider[] {
   const list: AIProvider[] = []
-  if (isUsableKey(env.KIMI_API_KEY)) list.push(buildKimi(env))
+  if (isUsableKey(env.DEEPSEEK_API_KEY)) list.push(buildDeepSeek(env))
   if (isUsableKey(env.OPENAI_API_KEY)) list.push(buildOpenAI(env))
+  if (isUsableKey(env.KIMI_API_KEY)) list.push(buildKimi(env))
   return list
 }
 
 /** True when at least one provider is configured. */
 export function hasProvider(env: ProviderEnv): boolean {
-  return isUsableKey(env.KIMI_API_KEY) || isUsableKey(env.OPENAI_API_KEY)
+  return isUsableKey(env.OPENAI_API_KEY) || isUsableKey(env.DEEPSEEK_API_KEY) || isUsableKey(env.KIMI_API_KEY)
 }
 
 /**

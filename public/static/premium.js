@@ -1,11 +1,9 @@
 /* InvestSafe Pro™ — Premium Services page interactions.
-   Ports the original app's openPremiumModal(type) / openAssetValModal(tier)
-   modal system to our Hono-served page. Forms POST to /api/premium-request. */
+   Forms POST to /api/premium-request. */
 (function () {
   'use strict';
 
-  // Per-service config used to populate the premium-request modal title + intro,
-  // mirroring the original Barry Minkow DD System service catalogue.
+  // Per-service config used to populate the premium-request modal title + intro.
   var PREMIUM_SERVICES = {
     tier1: {
       title: 'Request Tier 1 — Rapid Screen',
@@ -22,35 +20,10 @@
       price: 'Custom pricing · 10–15 business days',
       desc: 'Family offices, $1M+ allocations & regulatory referrals. Everything in Tiers 1 & 2 plus "Pose as Investor" engagement, full entity structure map, Co-GP double-count audit, tax lien & UCC sweep, referral-ready packages (SEC/DHS/FBI/FDIC/FINRA) and senior-analyst consultation.'
     },
-    title: {
-      title: 'Order Single Property Title Report',
-      price: '$15–$50',
-      desc: 'Full title chain, lien search, and deed history for one property. Identifies undisclosed mortgages the sponsor may be hiding from investors.'
-    },
-    bgcheck: {
-      title: 'Order Principal Background Check',
-      price: '$35–$150',
-      desc: 'FINRA BrokerCheck, PACER federal search, state court search, sex offender registry and criminal history for one named individual.'
-    },
-    ratios: {
-      title: 'Order Irrational Ratios Analysis',
-      price: '$200–$400',
-      desc: 'Full debt-service-vs-NOI mathematical analysis with documented source data — the single most powerful quantitative fraud indicator.'
-    },
-    entity: {
-      title: 'Order Entity Structure Mapping',
-      price: '$300–$600',
-      desc: 'Full org chart of all related entities, LLC members, registered agents, state filings and nominee-principal identification.'
-    },
-    ads: {
-      title: 'Order Ad & Marketing Archive Capture',
-      price: '$75–$200',
-      desc: 'Systematic capture & archiving of all known Facebook, Instagram, YouTube, TV and radio advertising with metadata, timestamps and targeting data via the Meta Ad Library.'
-    },
-    referral: {
-      title: 'Order Regulatory Referral Package',
-      price: '$500–$1,000',
-      desc: 'Existing findings formatted into agency-specific referral packages for SEC, DHS/HSI, FBI, FDIC or FINRA with proper exhibit labeling and chain-of-custody documentation.'
+    'title-background-combo': {
+      title: 'Order Title Report + Background Check Bundle',
+      price: '$49.95 · flat rate',
+      desc: 'Single property title report (full title chain, lien search, deed history, undisclosed mortgage detection) plus principal background check (FINRA BrokerCheck, PACER federal search, state court search, criminal history) — bundled together at one flat price.'
     }
   };
 
@@ -96,26 +69,6 @@
     openModal('modal-premium');
   }
 
-  function setAvalTier(tier) {
-    var isInst = tier === 'institutional';
-    var tierInput = $('#aval-tier');
-    if (tierInput) tierInput.value = tier;
-    var retail = $('#aval-retail-fields');
-    var inst = $('#aval-institutional-fields');
-    if (retail) retail.style.display = isInst ? 'none' : '';
-    if (inst) inst.style.display = isInst ? '' : 'none';
-    var addr = $('#aval-property-address');
-    if (addr) addr.required = !isInst;
-    $all('.aval-tier-opt').forEach(function (b) {
-      b.classList.toggle('active', b.getAttribute('data-aval-tier') === tier);
-    });
-  }
-
-  function openAssetValModal(tier) {
-    setAvalTier(tier || 'retail');
-    openModal('modal-assetval');
-  }
-
   // ── Toast ──
   var toastTimer = null;
   function toast(msg, kind) {
@@ -139,7 +92,6 @@
   function validateRequired(form) {
     var ok = true;
     $all('[required]', form).forEach(function (el) {
-      // Skip fields inside a hidden container (e.g. retail-only fields when institutional)
       if (el.offsetParent === null && el.type !== 'hidden') return;
       if (!String(el.value || '').trim()) {
         el.classList.add('invalid');
@@ -151,14 +103,14 @@
     return ok;
   }
 
-  function submitForm(form, kind, evt) {
+  function submitForm(form, evt) {
     evt.preventDefault();
     if (!validateRequired(form)) {
       toast('Please complete the required fields.', 'error');
       return;
     }
     var payload = serialize(form);
-    payload.kind = kind; // 'premium' | 'valuation'
+    payload.kind = 'premium';
     var btn = form.parentElement.querySelector('.modal-footer .btn-primary') ||
               document.querySelector('button[form="' + form.id + '"].btn-primary');
     if (btn) { btn.disabled = true; btn.dataset.label = btn.innerHTML; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Submitting…'; }
@@ -174,8 +126,7 @@
           var ref = res.body.reference ? ' (Ref: ' + res.body.reference + ')' : '';
           toast('Request received — our team will respond within one business day.' + ref, 'success');
           form.reset();
-          if (kind === 'valuation') setAvalTier('retail');
-          closeModal(kind === 'valuation' ? 'modal-assetval' : 'modal-premium');
+          closeModal('modal-premium');
         } else {
           toast((res.body && res.body.error) || 'Something went wrong. Please try again.', 'error');
         }
@@ -192,12 +143,8 @@
   document.addEventListener('click', function (e) {
     var openP = e.target.closest('[data-open-premium]');
     if (openP) { e.preventDefault(); openPremiumModal(openP.getAttribute('data-open-premium')); return; }
-    var openA = e.target.closest('[data-open-aval]');
-    if (openA) { e.preventDefault(); openAssetValModal(openA.getAttribute('data-open-aval')); return; }
     var closeBtn = e.target.closest('[data-close-modal]');
     if (closeBtn) { e.preventDefault(); closeModal(closeBtn.getAttribute('data-close-modal')); return; }
-    var tierBtn = e.target.closest('[data-aval-tier]');
-    if (tierBtn) { e.preventDefault(); setAvalTier(tierBtn.getAttribute('data-aval-tier')); return; }
     // click on overlay backdrop closes
     if (e.target.classList && e.target.classList.contains('modal-overlay') && e.target.classList.contains('open')) {
       closeModal(e.target.id);
@@ -212,12 +159,8 @@
   });
 
   var pForm = document.getElementById('premium-form');
-  if (pForm) pForm.addEventListener('submit', function (e) { submitForm(pForm, 'premium', e); });
-  var aForm = document.getElementById('aval-form');
-  if (aForm) aForm.addEventListener('submit', function (e) { submitForm(aForm, 'valuation', e); });
+  if (pForm) pForm.addEventListener('submit', function (e) { submitForm(pForm, e); });
 
-  // Expose (parity with original global fn names)
+  // Expose globally for parity with original system
   window.openPremiumModal = openPremiumModal;
-  window.openAssetValModal = openAssetValModal;
-  window.setAvalTier = setAvalTier;
 })();

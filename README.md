@@ -23,18 +23,19 @@ Frontend polls  ◀── GET /api/jobs/:id (progress) ◀──┤
 |------|----------------|
 | `src/providers.ts` | **AIProvider abstraction.** Kimi (primary) → OpenAI (fallback). OCR abstraction (`OcrProvider`) so Google Vision / Azure DI can be added later. Never uses a "mini" model for rule reasoning. |
 | `src/rules.ts` | The **21 fraud rules** (weights preserved), tier→severity table, the **per-chunk rule-evaluation prompt** (LLM returns evidence only, no scoring) and the **report prompt** (prose only). |
-| `src/chunking.ts` | **Semantic, page-aware chunking** (headings/sections/clauses/articles/tables), size-split fallback, `[[PAGE n]]` tracking, boilerplate skipping (index/blank/signature). Never truncates. |
+| `src/chunking.ts` | Legacy chunking utilities retained for compatibility, but analysis now runs in **single-pass mode** (no server-side chunk splitting). |
 | `src/merge.ts` | **Deterministic TypeScript merge + scoring** (NO LLM): dedupe, aggregate evidence, resolve conflicts (highest tier wins), aggregate confidence, compute weighted points / risk score / level / key drivers. |
 | `src/analyzer.ts` | Orchestrator: chunk → evaluate each chunk (all 21 rules) → merge (TS) → generate report (LLM prose only). |
-| `src/jobs.ts` | **Async job pipeline** (Queues-equivalent): R2 + D1 + tick processor. Self-provisions D1 schema. Migrating to Cloudflare Queues later = swap the tick loop for a queue consumer calling `processNextUnit`. |
-| `src/index.tsx` | Hono routes. |
+| `src/jobs.ts` | **Async job pipeline**: D1-persisted job IDs + server-side continuation (`waitUntil`) for resilient long tasks. Also exposes manual tick fallback. |
+| `src/index.tsx` | Hono routes + unified solutions page routing. |
 
 ### Provider selection (config-only switching)
-1. Valid `KIMI_API_KEY` → **Kimi** (`kimi-k2.7`) — primary (cost + long context).
-2. Else valid `OPENAI_API_KEY` → **OpenAI** (`gpt-4.1`) — fallback.
-3. Else → configuration error.
+1. Valid `DEEPSEEK_API_KEY` → **DeepSeek Pro v4** (`deepseek-pro-v4`) — primary.
+2. Else valid `OPENAI_API_KEY` → **OpenAI GPT-5 series** (`gpt-5`) — fallback.
+3. Else valid `KIMI_API_KEY` → **Kimi** (`kimi-k2.7`) — legacy fallback.
+4. Else → configuration error.
 
-The 21-rule evaluation and final report **always** use the provider's strongest reasoning model (`reason` role). Mini models are allowed only for optional `helper` preprocessing — never for fraud-rule reasoning.
+The 21-rule evaluation and final report **always** use the provider's strongest reasoning model (`reason` role). Mini/helper models are allowed only for optional lightweight preprocessing — never for fraud-rule reasoning.
 
 ### Determinism & separation of concerns
 - **LLM never computes the score.** It only reports, per chunk, which rules are triggered + confidence + evidence (page/quote/reason) + tier.
@@ -54,7 +55,9 @@ The 21-rule evaluation and final report **always** use the provider's strongest 
 | `POST` | `/api/analyze-chunk` | Evaluate one chunk (browser-driven fallback) |
 | `POST` | `/api/merge` | Merge + score + report (browser-driven fallback) |
 | `GET`  | `/api/framework` | The 21 rules |
-| `GET`  | `/api/plans`, `/api/premium`, `POST /api/premium-request` | Membership / premium services |
+| `GET`  | `/solution` | Unified solutions & pricing page (5 service tiers + $9.95 unlimited package) |
+| `GET`  | `/solutions`, `/pricing`, `/premium` | Legacy URLs (301 redirect to `/solution`) |
+| `POST` | `/api/solution-request` | Tier inquiry form submission from solution page modal |
 
 ## Data Architecture
 - **D1** (`investsafe-jobs`): `jobs` (id, status, progress, context, result_json), `job_chunks` (per-chunk eval_json). Migration: `migrations/0001_jobs.sql`; also self-provisioned at runtime.
@@ -62,8 +65,16 @@ The 21-rule evaluation and final report **always** use the provider's strongest 
 - **Per-chunk contract** (`rules.ts`): `{ chunk_id, page_range, is_investment_related, rules:[{rule_id, triggered, confidence, evidence_tier, evidence:[{page, section, quote, reason}]}], claims }`.
 - **Merged dataset** (`merge.ts`): findings with `weightedPoints`, `severity`, `confidence`, `pages`, aggregated evidence; `scoreBreakdown`.
 
-## Scoring (unchanged, deterministic)
+## Scoring (deterministic, with false-positive guardrails)
 `weightedPoints = round(weight × severity / 10)` · severity fixed by tier (T1=10, T2=8, T3=5, T4=3, GAP=0) · `riskScore = round(totalWeightedPoints / (maxPossiblePoints + stabilityFloor) × 100)` · levels: 0-24 Low, 25-49 Medium, 50-74 High, 75-100 Critical.
+
+Guardrails added in v6.1 calibration:
+- A chunk is investment-related **only** when the model explicitly returns `is_investment_related: true`.
+- Non-investment chunks are excluded from scoring merge.
+- Rule triggers require minimum confidence + concrete evidence length to prevent weak hallucinated hits.
+- If submission is classified as not investment-related, merged risk output is forced to neutral (`riskScore=0`, `Low`).
+- Frontend now shows a **conservative pre-analysis warning card** for likely non-investment submissions (e.g., generic AI/tutorial articles) with an explicit **Analyze anyway** override to avoid blocking real investment documents.
+- Free-tier browser tracking now enforces **3 checks/month per browser** and prompts upgrade to the **$9.95 Unlimited** package after the limit is reached.
 
 ## OCR
 Scanned PDFs / images are transcribed via the active provider's **vision** model (`OcrProvider` abstraction), preserving `[[PAGE n]]` markers and document order. A dedicated OCR vendor can be dropped in by returning a different `OcrProvider` from `selectOcrProvider()` — no pipeline changes.
@@ -83,10 +94,10 @@ npm run db:migrate:local              # or rely on runtime self-provisioning
 pm2 start ecosystem.config.cjs         # binds --d1=DB --r2=R2 --local
 curl http://localhost:3000/api/capabilities   # {"asyncJobs":true}
 ```
-Secrets in `.dev.vars` (git-ignored). Set `KIMI_API_KEY` to make Kimi active; otherwise `OPENAI_API_KEY` is used.
+Secrets in `.dev.vars` (git-ignored). Provider priority is `DEEPSEEK_API_KEY` (primary) → `OPENAI_API_KEY` → `KIMI_API_KEY`.
 
 ## Deployment
 - **Platform**: Cloudflare Pages + D1 + R2
 - **Status**: Local dev verified ✅ (async job, multi-chunk, page threading, legit=0/Low, high-risk=Critical, browser fallback)
 - **Tech Stack**: Hono + TypeScript + Vite + Wrangler; TailwindCSS (CDN) frontend
-- **Last Updated**: 2026-07-14 (v6.0 production redesign)
+- **Last Updated**: 2026-07-16 (solution page redesign with per-tier forms, browser-tracked free limit, and $9.95 unlimited package)

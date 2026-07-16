@@ -39,8 +39,7 @@ export function HomePage(): string {
   <nav class="nav-links">
     <a href="#how">How it works</a>
     <a href="#methodology">Methodology</a>
-    <a href="/pricing">Pricing</a>
-    <a href="/premium">Premium</a>
+    <a href="/solution">Solutions</a>
     <a href="#faq">FAQ</a>
     <a class="nav-cta" href="#analyze"><i class="fas fa-magnifying-glass-chart"></i> Check a pitch</a>
   </nav>

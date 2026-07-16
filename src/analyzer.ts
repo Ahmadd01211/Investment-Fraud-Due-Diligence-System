@@ -36,11 +36,8 @@ import {
   type RuleFinding,
 } from './rules'
 import {
-  chunkDocument,
   stripPageMarkers,
-  DEFAULT_CHUNK_OPTIONS,
   type Chunk,
-  type ChunkOptions,
 } from './chunking'
 import { mergeEvaluations, type MergedDataset, type MergedFinding } from './merge'
 
@@ -61,45 +58,8 @@ export type Bindings = ProviderEnv & {
   KV?: any     // KVNamespace — premium requests (existing)
 }
 
-// ── TPM-driven chunk sizing ───────────────────────────────────────
-const CHARS_PER_TOKEN = 4
-const TPM_INPUT_FRACTION = 0.5
-const HARD_MAX_CHUNK_CHARS = 300000
-const MIN_TPM_CHUNK = 8000
-const DEFAULT_TPM = 128000 // conservative modern default
-
 function clamp(v: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, v))
-}
-
-function parseTpm(raw?: string): number {
-  if (!raw) return 0
-  const s = String(raw).trim().toLowerCase()
-  const m = s.match(/^([\d.]+)\s*([km])?$/)
-  if (!m) return Number(s) || 0
-  let v = parseFloat(m[1])
-  if (m[2] === 'k') v *= 1000
-  if (m[2] === 'm') v *= 1000000
-  return Math.round(v)
-}
-
-/** Effective chunk-size options derived from env (TPM / manual overrides). */
-export function chunkOptionsFor(env: Bindings): ChunkOptions {
-  const explicit = Number(env.MAX_CHUNK_CHARS) || 0
-  let maxChunkChars: number
-  if (explicit > 0) {
-    maxChunkChars = clamp(explicit, MIN_TPM_CHUNK, HARD_MAX_CHUNK_CHARS)
-  } else {
-    // Kimi is primary → prefer KIMI_TPM if a Kimi key is set.
-    const tpm =
-      (env.KIMI_API_KEY ? parseTpm(env.KIMI_TPM) : 0) ||
-      parseTpm(env.OPENAI_TPM) ||
-      DEFAULT_TPM
-    maxChunkChars = clamp(Math.floor(tpm * TPM_INPUT_FRACTION * CHARS_PER_TOKEN), MIN_TPM_CHUNK, HARD_MAX_CHUNK_CHARS)
-  }
-  const minChunkChars = clamp(Number(env.MIN_CHUNK_CHARS) || DEFAULT_CHUNK_OPTIONS.minChunkChars, 1000, maxChunkChars)
-  const skipBoilerplate = env.SKIP_BOILERPLATE ? env.SKIP_BOILERPLATE !== 'false' : true
-  return { maxChunkChars, minChunkChars, maxChunks: DEFAULT_CHUNK_OPTIONS.maxChunks, skipBoilerplate }
 }
 
 // ── Structured context lines from the intake fields ──
@@ -127,9 +87,14 @@ function buildCtx(input: Partial<AnalyzeInput>): string[] {
 //  CHUNKING (public)
 // ════════════════════════════════════════════════════════════════
 
-/** Produce the semantic, page-aware chunks for a document. */
-export function buildChunks(env: Bindings, material: string): Chunk[] {
-  return chunkDocument(material, chunkOptionsFor(env))
+/**
+ * Single-pass mode: disable server chunking and analyze in one LLM request.
+ * (Requested for GPT-5 large-context usage.)
+ */
+export function buildChunks(_env: Bindings, material: string): Chunk[] {
+  const text = String(material || '').trim()
+  if (!text) return []
+  return [{ chunk_id: 0, text, startPage: 1, endPage: 1, headings: [] }]
 }
 
 export interface ChunkPlanInfo {
@@ -138,23 +103,12 @@ export interface ChunkPlanInfo {
   maxChunkChars: number
 }
 
-/** Report the chunking plan (how many chunks a doc of this text yields). */
-export function getChunkPlan(env: Bindings, docLenOrText: number | string): ChunkPlanInfo {
-  const opts = chunkOptionsFor(env)
-  // If we only have a length (legacy GET /api/chunk-plan?len=), estimate.
-  if (typeof docLenOrText === 'number') {
-    const needs = docLenOrText > opts.maxChunkChars
-    return {
-      needsChunking: needs,
-      totalChunks: needs ? Math.ceil(docLenOrText / opts.maxChunkChars) : 1,
-      maxChunkChars: opts.maxChunkChars,
-    }
-  }
-  const chunks = chunkDocument(docLenOrText, opts)
-  return { needsChunking: chunks.length > 1, totalChunks: chunks.length, maxChunkChars: opts.maxChunkChars }
+/** Report the chunking plan. In single-pass mode chunking is always disabled. */
+export function getChunkPlan(_env: Bindings, _docLenOrText: number | string): ChunkPlanInfo {
+  return { needsChunking: false, totalChunks: 1, maxChunkChars: 0 }
 }
 
-/** Authoritative server-side split (semantic). */
+/** Authoritative server-side split (single-pass mode always returns one chunk). */
 export function splitDocument(env: Bindings, text: string): { chunks: Chunk[] } {
   return { chunks: buildChunks(env, text) }
 }
@@ -166,7 +120,7 @@ export function splitDocument(env: Bindings, text: string): { chunks: Chunk[] } 
 function safeParseJson(content: string, finishReason: string | null): any {
   const trimmed = String(content).trim()
   if (finishReason === 'length') {
-    throw new Error('RESPONSE_TRUNCATED: A chunk response was cut off. Try smaller chunks (lower MAX_CHUNK_CHARS).')
+    throw new Error('RESPONSE_TRUNCATED: The model response was cut off due to size limits. Reduce non-essential content and retry.')
   }
   const looksJson = trimmed.startsWith('{') || trimmed.startsWith('[') || /\{[\s\S]*\}/.test(trimmed)
   if (!looksJson) {
@@ -216,7 +170,8 @@ function normalizeChunkEval(raw: any, chunk: Chunk): ChunkEvaluation {
   return {
     chunk_id: chunk.chunk_id,
     page_range: [chunk.startPage || 0, chunk.endPage || 0],
-    is_investment_related: raw?.is_investment_related !== false,
+    // Strict parsing: only explicit true counts as investment-related.
+    is_investment_related: raw?.is_investment_related === true,
     not_relevant_reason: String(raw?.not_relevant_reason || ''),
     rules,
     claims: Array.isArray(raw?.claims) ? raw.claims : [],
@@ -386,7 +341,7 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
   }
   const provider = selectProvider(env)
   const ctx = buildCtx(input)
-  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 4)
+  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 10)
   const rawMaterial = (input.material || '').trim()
 
   // OCR: if only images (or images + little text), transcribe them into text
@@ -452,7 +407,7 @@ export async function analyzeChunkRequest(env: Bindings, input: ChunkRequestInpu
   }
   const provider = selectProvider(env)
   const ctx = buildCtx(input)
-  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 4)
+  const images = (input.images || []).filter((s) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 10)
   const chunk: Chunk = {
     chunk_id: Number(input.chunkIndex) || 0,
     text: String(input.chunk || ''),

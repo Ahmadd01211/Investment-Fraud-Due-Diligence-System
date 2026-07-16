@@ -9,19 +9,9 @@ import {
   FLAG_FRAMEWORK,
   type Bindings,
 } from './analyzer'
-import { createJob, getJobStatus, getJobResult, processNextUnit, jobsAvailable } from './jobs'
+import { createJob, getJobStatus, getJobResult, processNextUnit, processJobToCompletion, jobsAvailable } from './jobs'
 import { HomePage } from './page'
-import { PricingPage } from './pricing'
 import { PremiumPage } from './premium'
-import {
-  PLANS,
-  ONE_TIME_OFFERINGS,
-  CURRENCY,
-  PREMIUM_AUDIENCES,
-  SERVICE_TIERS,
-  ADDON_SERVICES,
-  VALUATION_CARDS,
-} from './plans'
 
 const app = new Hono<{ Bindings: Bindings }>()
 
@@ -51,7 +41,7 @@ function mapAnalyzeError(err: any): { status: number; body: any } {
     return { status: 503, body: { error: 'The analysis service is temporarily unavailable (the shared AI credits have run out). Please try again later.' } }
   }
   if (raw.startsWith('RESPONSE_TRUNCATED:')) {
-    return { status: 400, body: { error: 'A chunk of this document was too large to analyze. Please try again — the system will use smaller chunks.' } }
+    return { status: 400, body: { error: 'This document exceeded model response limits. Please trim non-essential pages and retry.' } }
   }
   if (raw.startsWith('SERVICE_AUTH:')) {
     return { status: 503, body: { error: 'The analysis service is not configured correctly (server API key issue). Please contact the site owner.' } }
@@ -83,7 +73,7 @@ app.post('/api/jobs', async (c) => {
   }
   const material = (body?.material || '').toString().trim()
   const images: string[] = Array.isArray(body?.images)
-    ? body.images.filter((s: any) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 4)
+    ? body.images.filter((s: any) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 10)
     : []
   if (material.length < 30 && images.length === 0) {
     return c.json({ error: 'Please paste at least a few sentences — or attach a document/image — so we can analyze it.' }, 400)
@@ -98,6 +88,10 @@ app.post('/api/jobs', async (c) => {
       amountAsked: body?.amountAsked,
       sourceType: body?.sourceType,
     })
+
+    // Background continuation: process the job without requiring the browser to keep ticking.
+    c.executionCtx.waitUntil(processJobToCompletion(c.env, jobId).catch(() => {}))
+
     return c.json({ ok: true, jobId, totalChunks })
   } catch (err: any) {
     const { status, body: eb } = mapAnalyzeError(err)
@@ -107,8 +101,15 @@ app.post('/api/jobs', async (c) => {
 
 app.get('/api/jobs/:id', async (c) => {
   if (!jobsAvailable(c.env)) return c.json({ error: 'async_unavailable' }, 501)
-  const status = await getJobStatus(c.env, c.req.param('id'))
+  const jobId = c.req.param('id')
+  const status = await getJobStatus(c.env, jobId)
   if (!status) return c.json({ error: 'Job not found.' }, 404)
+
+  // Auto-kick background runner on polling so interrupted sessions can resume processing.
+  if (status.status === 'analyzing' || status.status === 'merging' || status.status === 'reporting') {
+    c.executionCtx.waitUntil(processJobToCompletion(c.env, jobId).catch(() => {}))
+  }
+
   return c.json(status)
 })
 
@@ -144,7 +145,7 @@ app.post('/api/analyze', async (c) => {
   }
   const material = (body?.material || '').toString().trim()
   const images: string[] = Array.isArray(body?.images)
-    ? body.images.filter((s: any) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 4)
+    ? body.images.filter((s: any) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 10)
     : []
   if (material.length < 30 && images.length === 0) {
     return c.json({ error: 'Please paste at least a few sentences — or attach a document or image of the investment pitch — so we can analyze it.' }, 400)
@@ -204,7 +205,7 @@ app.post('/api/analyze-chunk', async (c) => {
   }
   const chunk = (body?.chunk || '').toString()
   const images: string[] = Array.isArray(body?.images)
-    ? body.images.filter((s: any) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 4)
+    ? body.images.filter((s: any) => typeof s === 'string' && s.startsWith('data:image')).slice(0, 10)
     : []
   if (chunk.trim().length === 0 && images.length === 0) {
     return c.json({ error: 'Empty chunk.' }, 400)
@@ -256,23 +257,50 @@ app.get('/api/framework', (c) => c.json({ flags: FLAG_FRAMEWORK }))
 // ── capabilities (frontend decides async vs browser-driven) ──
 app.get('/api/capabilities', (c) => c.json({ asyncJobs: jobsAvailable(c.env) }))
 
-// ── membership plans + one-time offerings ──
-app.get('/api/plans', (c) => c.json({ currency: CURRENCY, plans: PLANS, oneTimeOfferings: ONE_TIME_OFFERINGS }))
-
 // ── Pages ──
 app.get('/', (c) => c.html(HomePage()))
-app.get('/pricing', (c) => c.html(PricingPage()))
-app.get('/premium', (c) => c.html(PremiumPage()))
+app.get('/solution', (c) => c.html(PremiumPage()))
 
-app.get('/api/premium', (c) =>
-  c.json({
-    currency: CURRENCY,
-    audiences: PREMIUM_AUDIENCES,
-    serviceTiers: SERVICE_TIERS,
-    addOns: ADDON_SERVICES,
-    valuation: VALUATION_CARDS,
+// legacy links now point to the unified solutions page
+app.get('/solutions', (c) => c.redirect('/solution', 301))
+app.get('/pricing', (c) => c.redirect('/solution', 301))
+app.get('/premium', (c) => c.redirect('/solution', 301))
+
+app.post('/api/solution-request', async (c) => {
+  let body: Record<string, any>
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ ok: false, error: 'Invalid request payload.' }, 400)
+  }
+
+  const name = String(body.name || '').trim()
+  const email = String(body.email || '').trim()
+  const tierId = String(body.tierId || '').trim()
+  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+
+  if (!name || !emailOk || !tierId) {
+    return c.json({ ok: false, error: 'Name, email, and selected tier are required.' }, 400)
+  }
+
+  const reference = `SR-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
+  const record = { reference, receivedAt: new Date().toISOString(), ...body }
+
+  try {
+    const kv = (c.env as any)?.KV
+    if (kv && typeof kv.put === 'function') {
+      await kv.put(`solution-request:${reference}`, JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 90 })
+    }
+  } catch {
+    /* optional */
+  }
+
+  return c.json({
+    ok: true,
+    reference,
+    message: 'Request received. Our team will contact you shortly with next steps.',
   })
-)
+})
 
 app.post('/api/premium-request', async (c) => {
   let body: Record<string, any>
@@ -281,25 +309,19 @@ app.post('/api/premium-request', async (c) => {
   } catch {
     return c.json({ ok: false, error: 'Invalid request payload.' }, 400)
   }
-  const kind = body.kind === 'valuation' ? 'valuation' : 'premium'
+
   const name = String(body.name || '').trim()
   const email = String(body.email || '').trim()
+  const serviceType = String(body.serviceType || '').trim()
   const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+
   if (!name || !emailOk) {
-    return c.json({ ok: false, error: 'A valid name and email address are required.' }, 400)
+    return c.json({ ok: false, error: 'Name and valid email are required.' }, 400)
   }
-  if (kind === 'premium') {
-    if (!String(body.target || '').trim() || !String(body.clientType || '').trim()) {
-      return c.json({ ok: false, error: 'Client type and subject of investigation are required.' }, 400)
-    }
-  } else {
-    if (!String(body.sponsor || '').trim()) {
-      return c.json({ ok: false, error: 'Sponsor / syndicator name is required.' }, 400)
-    }
-  }
-  const prefix = kind === 'valuation' ? 'AV' : 'PS'
-  const reference = `${prefix}-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
-  const record = { reference, kind, receivedAt: new Date().toISOString(), ...body }
+
+  const reference = `PR-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
+  const record = { reference, receivedAt: new Date().toISOString(), serviceType, ...body }
+
   try {
     const kv = (c.env as any)?.KV
     if (kv && typeof kv.put === 'function') {
@@ -308,10 +330,11 @@ app.post('/api/premium-request', async (c) => {
   } catch {
     /* optional */
   }
+
   return c.json({
     ok: true,
     reference,
-    message: 'Request received. A member of our team will respond within one business day to confirm scope, pricing, and engagement letter.',
+    message: 'Request received. Our team will respond within one business day.',
   })
 })
 

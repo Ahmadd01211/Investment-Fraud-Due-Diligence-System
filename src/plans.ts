@@ -347,68 +347,13 @@ export const SERVICE_TIERS: ServiceTier[] = [
 
 export const ADDON_SERVICES: AddOnService[] = [
   {
-    id: 'title-report',
-    icon: 'fa-file-lines',
-    title: 'Single Property Title Report',
-    price: '$15\u2013$50',
+    id: 'title-background-combo',
+    icon: 'fa-file-shield',
+    title: 'Title Report + Background Check',
+    price: '$49.95',
     desc:
-      'Full title chain, lien search, deed history. Identify undisclosed mortgages that sponsor is hiding from investors.',
-    cta: 'Order Title',
-  },
-  {
-    id: 'background-check',
-    icon: 'fa-user-magnifying-glass',
-    title: 'Principal Background Check',
-    price: '$35\u2013$150',
-    desc:
-      'FINRA BrokerCheck, PACER federal search, state court search, sex offender registry, criminal history for one named individual.',
-    cta: 'Order Check',
-  },
-  {
-    id: 'asset-valuation',
-    icon: 'fa-building-circle-check',
-    title: 'Asset Valuation & Debt Confirmation',
-    price: '$75\u2013$150',
-    priceNote: 'Retail / Custom Institutional',
-    desc:
-      'Independent book value, subcategory cap rate, confirmed recorded debt, last sale price (incl. non-disclosure states), and ownership verification for any claimed asset.',
-    cta: 'Order Valuation',
-  },
-  {
-    id: 'irrational-ratios',
-    icon: 'fa-calculator',
-    title: 'Irrational Ratios Analysis',
-    price: '$200\u2013$400',
-    desc:
-      'Full debt-service-vs-NOI mathematical analysis with documented source data. The single most powerful quantitative fraud indicator.',
-    cta: 'Order Analysis',
-  },
-  {
-    id: 'entity-mapping',
-    icon: 'fa-sitemap',
-    title: 'Entity Structure Mapping',
-    price: '$300\u2013$600',
-    desc:
-      'Full org chart of all related entities, LLC members, registered agents, state filings, and nominee principal identification.',
-    cta: 'Order Mapping',
-  },
-  {
-    id: 'ad-archive',
-    icon: 'fa-rectangle-ad',
-    title: 'Ad & Marketing Archive Capture',
-    price: '$75\u2013$200',
-    desc:
-      'Systematic capture and archiving of all known Facebook, Instagram, YouTube, TV, and radio advertising with metadata, timestamps, and targeting data via Meta Ad Library.',
-    cta: 'Order Capture',
-  },
-  {
-    id: 'referral-package',
-    icon: 'fa-gavel',
-    title: 'Regulatory Referral Package',
-    price: '$500\u2013$1,000',
-    desc:
-      'Existing findings formatted into agency-specific referral packages for SEC, DHS/HSI, FBI, FDIC, or FINRA with proper exhibit labeling and chain-of-custody documentation.',
-    cta: 'Order Package',
+      'Single property title report (full title chain, lien search, deed history, undisclosed mortgage detection) plus principal background check (FINRA BrokerCheck, PACER federal search, state court search, criminal history) — bundled together at one flat price.',
+    cta: 'Order Bundle',
   },
 ]
 

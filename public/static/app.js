@@ -43,6 +43,38 @@
     toastT = setTimeout(() => t.classList.remove('show'), 3600);
   }
 
+  // ── free-tier browser tracking (3 checks / month) ──
+  const FREE_LIMIT_PER_MONTH = 3;
+  const FREE_USAGE_KEY = 'investsafe_free_usage_v1';
+  const UNLIMITED_PLAN_URL = '/solution#tier-unlimited';
+
+  function currentMonthKey() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  }
+
+  function getFreeUsage() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(FREE_USAGE_KEY) || '{}');
+      const month = currentMonthKey();
+      if (parsed.month !== month) return { month, count: 0 };
+      return { month, count: Math.max(0, Number(parsed.count) || 0) };
+    } catch {
+      return { month: currentMonthKey(), count: 0 };
+    }
+  }
+
+  function saveFreeUsage(state) {
+    try { localStorage.setItem(FREE_USAGE_KEY, JSON.stringify(state)); } catch {}
+  }
+
+  function incrementFreeUsage() {
+    const s = getFreeUsage();
+    s.count += 1;
+    saveFreeUsage(s);
+    return s.count;
+  }
+
   /* ── elements ── */
   const material = $('#material');
   const charCount = $('#charCount');
@@ -52,8 +84,109 @@
   const resultsContent = $('#resultsContent');
   const loadingMsg = $('#loadingMsg');
 
+  // Pre-analysis caution card: warns on likely non-investment text,
+  // but stays conservative to avoid blocking valid investment submissions.
+  const precheckCard = document.createElement('div');
+  precheckCard.id = 'precheckCard';
+  precheckCard.className = 'precheck-card';
+  precheckCard.hidden = true;
+  analyzeBtn.parentNode.insertBefore(precheckCard, analyzeBtn);
+
+  function resetPrecheckApproval() {
+    analyzeBtn.removeAttribute('data-precheck-approved');
+  }
+
+  function hidePrecheckCard() {
+    precheckCard.hidden = true;
+    precheckCard.innerHTML = '';
+  }
+
+  function countKeywordHits(text, patterns) {
+    return patterns.filter((p) => p.test(text)).length;
+  }
+
+  function assessLikelyNonInvestment(text, meta, imageCount) {
+    const raw = String(text || '').trim();
+    if (!raw || raw.length < 120) return { shouldWarn: false, reason: '' };
+
+    // If user attached images, keep friction low (screenshots/scanned docs are common).
+    if (imageCount > 0) return { shouldWarn: false, reason: '' };
+
+    const hasInvestorMeta = [meta.sponsorName, meta.assetType, meta.claimedReturn, meta.amountAsked, meta.sourceType]
+      .some((v) => String(v || '').trim().length > 0);
+    if (hasInvestorMeta) return { shouldWarn: false, reason: '' };
+
+    const t = raw.toLowerCase();
+
+    const investmentSignals = [
+      /\binvest(ment|or|ing)?\b/, /\bfund\b/, /\bprivate placement\b/, /\bppm\b/, /\boffering memorandum\b/, /\bprospectus\b/,
+      /\bsecurit(y|ies)\b/, /\bstock(s)?\b/, /\bbond(s)?\b/, /\bnote(s)?\b/, /\bsyndicat(e|ion)\b/, /\baccredited\b/,
+      /\breturn(s)?\b/, /\birr\b/, /\byield\b/, /\bdividend(s)?\b/, /\bprincipal\b/, /\binterest rate\b/, /\bapr\b/,
+      /\bminimum investment\b/, /\bcapital\b/, /\bwire\b/, /\bsubscription\b/, /\bsec\b/, /\bfinra\b/, /\bform d\b/,
+      /\$\s?\d/, /\b\d+%\b/
+    ];
+
+    const nonInvestmentSignals = [
+      /\bartificial intelligence\b/, /\bmachine learning\b/, /\bdeep learning\b/, /\bllm\b/, /\bprompt engineering\b/,
+      /\bneural network\b/, /\btransformer(s)?\b/, /\btraining data\b/, /\bdataset\b/, /\bpython\b/, /\bjavascript\b/,
+      /\bgithub\b/, /\bapi reference\b/, /\bdocumentation\b/, /\btutorial\b/, /\bhow to\b/, /\bbenchmark\b/, /\bmodel card\b/
+    ];
+
+    const investmentHits = countKeywordHits(t, investmentSignals);
+    const nonInvestmentHits = countKeywordHits(t, nonInvestmentSignals);
+
+    // Very conservative warning: only when we see strong non-investment cues
+    // and zero investment cues, to avoid false blocking of real investment docs.
+    if (investmentHits === 0 && nonInvestmentHits >= 4) {
+      return {
+        shouldWarn: true,
+        reason: 'This looks like a general tech/AI article rather than an investment pitch or solicitation.'
+      };
+    }
+
+    return { shouldWarn: false, reason: '' };
+  }
+
+  function showPrecheckCard(reason) {
+    precheckCard.innerHTML = `
+      <div class="precheck-title"><i class="fas fa-circle-info"></i> Quick check before analysis</div>
+      <p>${esc(reason)}</p>
+      <ul>
+        <li>We usually analyze investment offers, fund decks, ads, and solicitations.</li>
+        <li>If this is still an investment document, you can continue anyway.</li>
+      </ul>
+      <div class="precheck-actions">
+        <button class="mini-btn" type="button" id="precheckEdit"><i class="fas fa-pen"></i> Review text</button>
+        <button class="mini-btn proceed" type="button" id="precheckProceed"><i class="fas fa-forward"></i> Analyze anyway</button>
+      </div>`;
+    precheckCard.hidden = false;
+
+    const editBtn = $('#precheckEdit', precheckCard);
+    const proceedBtn = $('#precheckProceed', precheckCard);
+
+    if (editBtn) {
+      editBtn.addEventListener('click', () => {
+        hidePrecheckCard();
+        material.focus();
+      });
+    }
+
+    if (proceedBtn) {
+      proceedBtn.addEventListener('click', () => {
+        analyzeBtn.setAttribute('data-precheck-approved', '1');
+        hidePrecheckCard();
+        analyze();
+      });
+    }
+  }
+
   const updateCount = () => { charCount.textContent = `${material.value.length.toLocaleString()} characters`; };
-  material.addEventListener('input', updateCount); updateCount();
+  material.addEventListener('input', () => {
+    resetPrecheckApproval();
+    hidePrecheckCard();
+    updateCount();
+  });
+  updateCount();
 
   /* ── file upload + drag/drop ── */
   const dropzone = $('#dropzone');
@@ -63,7 +196,8 @@
 
   /* attached images go to the vision backend; max 4 */
   const attachedImages = []; // { name, dataUrl }
-  const MAX_IMAGES = 4;
+  const MAX_IMAGES = 120;
+  const IMAGE_BATCH_SIZE = 10;
   const MAX_FILE = 12 * 1024 * 1024; // 12 MB per file
 
   function fileKind(file) {
@@ -102,23 +236,103 @@
     });
   }
 
-  async function extractPdf(file) {
+  function cleanExtractedLine(line) {
+    return String(line || '')
+      .replace(/\s+/g, ' ')
+      .replace(/\s+([,.;:!?])/g, '$1')
+      .replace(/[ \t]+$/g, '')
+      .trim();
+  }
+
+  function mergeLineItems(items) {
+    if (!items.length) return '';
+    const sorted = [...items].sort((a, b) => a.x - b.x);
+    let line = '';
+    let prevX = null;
+    let prevW = 0;
+    for (const it of sorted) {
+      const text = String(it.str || '');
+      if (!text.trim()) continue;
+      if (prevX !== null) {
+        const gap = it.x - (prevX + prevW);
+        if (gap > 2) line += ' ';
+      }
+      line += text;
+      prevX = it.x;
+      prevW = Number(it.w) || 0;
+    }
+    return cleanExtractedLine(line);
+  }
+
+  async function extractPdfPayload(file) {
     if (!window.pdfjsLib) throw new Error('PDF reader still loading — try again in a moment.');
     const buf = await readAsArrayBuffer(file);
     const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
-    let out = '';
-    // NO content truncation — the backend chunk-and-merge pipeline handles any
-    // size. We only guard against a pathological page count to protect browser
-    // memory; real documents fall far under this.
-    const pages = Math.min(pdf.numPages, 20000);
-    for (let i = 1; i <= pages; i++) {
+
+    const pageCount = Math.min(pdf.numPages, MAX_IMAGES - attachedImages.length);
+    const images = [];
+    const pageTextBlocks = [];
+    let textPages = 0;
+
+    for (let i = 1; i <= pageCount; i++) {
       const page = await pdf.getPage(i);
+
+      // 1) Render page image for vision pipeline.
+      const viewport = page.getViewport({ scale: 1.4 });
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      canvas.width = Math.floor(viewport.width);
+      canvas.height = Math.floor(viewport.height);
+      if (!ctx) throw new Error('Could not render PDF page.');
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      images.push({
+        name: `${file.name || 'pdf'} - page ${i}`,
+        dataUrl: canvas.toDataURL('image/jpeg', 0.88),
+      });
+
+      // 2) Gracefully extract selectable text.
       const content = await page.getTextContent();
-      // Emit an explicit page marker before each page's text so the backend can
-      // map extracted-text offsets back to page numbers for evidence refs.
-      out += `\n[[PAGE ${i}]]\n` + content.items.map((it) => it.str).join(' ') + '\n';
+      const tokens = (content.items || [])
+        .map((it) => ({
+          str: String(it.str || ''),
+          x: Number(it.transform?.[4]) || 0,
+          y: Number(it.transform?.[5]) || 0,
+          w: Number(it.width) || 0,
+        }))
+        .filter((it) => it.str.trim().length > 0);
+
+      if (!tokens.length) continue;
+
+      // Group tokens by visual text lines.
+      const lineBuckets = [];
+      const Y_TOL = 3;
+      for (const tk of tokens) {
+        let bucket = lineBuckets.find((b) => Math.abs(b.y - tk.y) <= Y_TOL);
+        if (!bucket) {
+          bucket = { y: tk.y, items: [] };
+          lineBuckets.push(bucket);
+        }
+        bucket.items.push(tk);
+      }
+
+      // PDF y-axis is bottom-up; read top-to-bottom by descending y.
+      lineBuckets.sort((a, b) => b.y - a.y);
+      const lines = lineBuckets.map((b) => mergeLineItems(b.items)).filter(Boolean);
+      const pageText = lines.join('\n').trim();
+
+      if (pageText.length >= 40) {
+        textPages += 1;
+        pageTextBlocks.push(`[[PAGE ${i}]]\n${pageText}`);
+      }
     }
-    return out.trim();
+
+    return {
+      images,
+      totalPages: pdf.numPages,
+      renderedPages: pageCount,
+      extractedText: pageTextBlocks.join('\n\n').trim(),
+      hasReadableText: textPages > 0,
+    };
   }
   async function extractDocx(file) {
     if (!window.mammoth) throw new Error('Word reader still loading — try again in a moment.');
@@ -151,6 +365,9 @@
   async function handleFiles(fileList) {
     const files = [...fileList].filter(Boolean);
     if (!files.length) return;
+
+    resetPrecheckApproval();
+    hidePrecheckCard();
     for (const file of files) {
       if (file.size > MAX_FILE) { toast(`"${file.name}" is too large (max 12 MB).`, 'err'); continue; }
       const kind = fileKind(file);
@@ -162,14 +379,24 @@
           renderAttachList();
           toast(`Attached image "${file.name}"`, 'ok');
         } else if (kind === 'pdf') {
-          toast(`Reading PDF "${file.name}"…`, 'ok');
-          const text = await extractPdf(file);
-          if (text.length < 10) {
-            // Likely a scanned/image PDF — offer to attach pages as image? Inform user.
-            toast(`"${file.name}" has little selectable text — if it's a scanned PDF, attach a screenshot instead.`, 'err');
+          toast(`Processing PDF "${file.name}"…`, 'ok');
+          const { images, totalPages, renderedPages, extractedText, hasReadableText } = await extractPdfPayload(file);
+          if (!images.length) {
+            toast(`Could not extract pages from "${file.name}".`, 'err');
           } else {
-            appendToMaterial(text, file.name);
-            toast(`Loaded text from "${file.name}"`, 'ok');
+            attachedImages.push(...images);
+            renderAttachList();
+
+            if (hasReadableText && extractedText) {
+              appendToMaterial(extractedText, `${file.name} (extracted text)`);
+              toast(`Attached ${renderedPages} page images and added clean extracted text from "${file.name}".`, 'ok');
+            } else {
+              toast(`Attached ${renderedPages} page images from "${file.name}" (image-only PDF).`, 'ok');
+            }
+
+            if (totalPages > renderedPages) {
+              toast(`Only ${renderedPages} of ${totalPages} pages were attached (image limit reached).`, 'err');
+            }
           }
         } else if (kind === 'docx') {
           toast(`Reading Word doc "${file.name}"…`, 'ok');
@@ -190,6 +417,11 @@
 
   fileInput.addEventListener('change', (e) => { handleFiles(e.target.files); e.target.value = ''; });
   cameraInput.addEventListener('change', (e) => { handleFiles(e.target.files); e.target.value = ''; });
+  ['sponsorName', 'assetType', 'claimedReturn', 'amountAsked', 'sourceType'].forEach((id) => {
+    const el = $('#' + id);
+    if (el) el.addEventListener('input', () => { resetPrecheckApproval(); hidePrecheckCard(); });
+    if (el && el.tagName === 'SELECT') el.addEventListener('change', () => { resetPrecheckApproval(); hidePrecheckCard(); });
+  });
   ['dragenter', 'dragover'].forEach((ev) => dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.add('drag'); }));
   ['dragleave', 'drop'].forEach((ev) => dropzone.addEventListener(ev, (e) => { e.preventDefault(); if (ev === 'drop') handleFiles(e.dataTransfer.files); dropzone.classList.remove('drag'); }));
 
@@ -206,6 +438,8 @@
     attachedImages.length = 0; renderAttachList();
     ['sponsorName', 'assetType', 'claimedReturn', 'amountAsked'].forEach((id) => { $('#' + id).value = ''; });
     $('#sourceType').value = '';
+    resetPrecheckApproval();
+    hidePrecheckCard();
     showState('empty'); material.focus();
   });
 
@@ -234,6 +468,8 @@
     $('#claimedReturn').value = s.meta.claimedReturn || '';
     $('#amountAsked').value = s.meta.amountAsked || '';
     $('#sourceType').value = s.meta.sourceType || '';
+    resetPrecheckApproval();
+    hidePrecheckCard();
     document.getElementById('analyze').scrollIntoView({ behavior: 'smooth' });
     toast('Sample loaded — hit Analyze', 'ok');
   }
@@ -270,6 +506,17 @@
     if (ok) ok.addEventListener('click', () => { resultsEmpty.innerHTML = EMPTY_DEFAULT_HTML; material.focus(); });
   }
 
+  function showFreeLimitNotice() {
+    showNotice(
+      'Free limit reached for this browser',
+      'You have used all 3 free reports this month. Upgrade to the $9.95 Unlimited package to keep running checks with unlimited 21 red flag detection.'
+    );
+    const ok = $('#noticeOk');
+    if (ok) {
+      ok.insertAdjacentHTML('afterend', ` <a class="mini-btn" href="${UNLIMITED_PLAN_URL}"><i class="fas fa-arrow-up-right-from-square"></i> Upgrade to $9.95 Unlimited</a>`);
+    }
+  }
+
   /* ── analyze ── */
   const LOAD_MSGS = ['Reading the document…', 'Extracting the promoter\'s claims…', 'Checking 21 fraud patterns…', 'Cross-referencing with known schemes…', 'Building your report…'];
   let msgTimer;
@@ -290,49 +537,41 @@
     });
     const cdata = await cres.json();
     if (handleErr(cdata, cres)) return null;
+
     const jobId = cdata.jobId;
     const total = Number(cdata.totalChunks) || 1;
-    loadingMsg.textContent = `Analyzing document — 0 of ${total} sections…`;
+    loadingMsg.textContent = `Analyzing document in background — 0 of ${total} sections…`;
 
-    // Drive the job to completion by ticking. Each tick = one unit of work.
+    // Poll status only. Server runs background continuation using waitUntil.
     let guard = 0;
-    const MAX_TICKS = total + 8 + total * 6; // chunks + merge/report + retry budget
-    while (guard++ < MAX_TICKS) {
-      const tres = await fetch(`/api/jobs/${jobId}/tick`, { method: 'POST' });
-      let t;
-      try { t = await tres.json(); } catch { t = {}; }
+    const MAX_POLLS = 240;
+    while (guard++ < MAX_POLLS) {
+      const sres = await fetch(`/api/jobs/${jobId}`);
+      const sdata = await sres.json();
+      if (!sres.ok || sdata.error) throw new Error((sdata && (sdata.message || sdata.error)) || 'Job status unavailable.');
 
-      if (t.error && tres.status !== 429) {
-        // Non-retryable job error.
-        if (tres.status === 422 && t.error === 'invalid_submission') { if (handleErr(t, tres)) return null; }
-        throw new Error(t.message || t.error || 'Analysis failed.');
-      }
-
-      const done = Number(t.doneChunks) || 0;
-      const prog = Number(t.progress) || 0;
-      if (t.status === 'merging' || t.status === 'reporting') {
+      const done = Number(sdata.doneChunks) || 0;
+      const prog = Number(sdata.progress) || 0;
+      if (sdata.status === 'merging' || sdata.status === 'reporting') {
         loadingMsg.textContent = 'Combining findings into your final report…';
       } else {
-        loadingMsg.textContent = `Analyzing document — ${done} of ${total} sections… (${prog}%)`;
+        loadingMsg.textContent = `Analyzing document in background — ${done} of ${total} sections… (${prog}%)`;
       }
 
-      if (t.status === 'not_relevant') {
+      if (sdata.status === 'not_relevant') {
         showState('empty');
         showNotice("This doesn't look like an investment",
           'The document did not appear to be an investment offering, pitch, or solicitation. Please submit an investment-related document.');
         toast('Not an investment — nothing to analyze', 'err');
         return null;
       }
-      if (t.finished || t.status === 'done') break;
 
-      // Rate-limit backoff hint from the server (provider TPM window).
-      if (t.retryAfter) {
-        const w = Math.max(1, Number(t.retryAfter));
-        loadingMsg.textContent = `Analyzing document — ${done} of ${total} sections… (service busy, waiting ${w}s)`;
-        await sleep(w * 1000 + 300);
-      } else {
-        await sleep(350); // gentle pacing between ticks
+      if (sdata.status === 'error') {
+        throw new Error(sdata.error || 'Analysis failed.');
       }
+
+      if (sdata.hasResult || sdata.status === 'done') break;
+      await sleep(1000);
     }
 
     // Fetch the final assembled result.
@@ -340,6 +579,49 @@
     const rdata = await rres.json();
     if (!rres.ok || rdata.error) throw new Error(rdata.error || 'Could not retrieve the report.');
     return rdata.result;
+  }
+
+  /* ── IMAGE-BATCH PIPELINE: send PDF pages/images in loops of 10 ── */
+  async function runImageBatchPipeline(images, meta, handleErr) {
+    clearInterval(msgTimer);
+    const totalBatches = Math.ceil(images.length / IMAGE_BATCH_SIZE);
+    const results = [];
+
+    for (let i = 0; i < totalBatches; i++) {
+      const batch = images.slice(i * IMAGE_BATCH_SIZE, (i + 1) * IMAGE_BATCH_SIZE);
+      loadingMsg.textContent = `Analyzing image batch ${i + 1} of ${totalBatches}…`;
+
+      const res = await fetch('/api/analyze-chunk', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chunk: `(image batch ${i + 1}/${totalBatches})`,
+          chunkIndex: i,
+          totalChunks: totalBatches,
+          startPage: i * IMAGE_BATCH_SIZE + 1,
+          endPage: i * IMAGE_BATCH_SIZE + batch.length,
+          headings: [],
+          images: batch,
+          ...meta,
+        }),
+      });
+      const data = await res.json();
+      if (handleErr(data, res)) return null;
+      if (data && data.result) results.push(data.result);
+      await sleep(250);
+    }
+
+    if (!results.length) {
+      throw new Error('No image batches were analyzed. Please retry.');
+    }
+
+    loadingMsg.textContent = 'Combining findings into your final report…';
+    const mres = await fetch('/api/merge', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ results }),
+    });
+    const mdata = await mres.json();
+    if (handleErr(mdata, mres)) return null;
+    return mdata.result;
   }
 
   /* ── BROWSER-DRIVEN FALLBACK (no D1/R2): split → analyze-chunk → merge ── */
@@ -423,16 +705,20 @@
   }
 
   async function analyze() {
+    const usage = getFreeUsage();
+    if (usage.count >= FREE_LIMIT_PER_MONTH) {
+      showState('empty');
+      showFreeLimitNotice();
+      toast('Free tier limit reached. Upgrade to Unlimited to continue.', 'err');
+      return;
+    }
+
     const text = material.value.trim();
     if (text.length < 30 && attachedImages.length === 0) {
       toast('Please paste at least a few sentences — or attach a document or image — to analyze.', 'err');
       material.focus();
       return;
     }
-    analyzeBtn.disabled = true;
-    analyzeBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Analyzing…';
-    showState('loading'); cycleMsgs();
-    document.getElementById('analyze').scrollIntoView({ behavior: 'smooth', block: 'start' });
 
     const meta = {
       sponsorName: $('#sponsorName').value.trim(),
@@ -442,6 +728,22 @@
       sourceType: $('#sourceType').value.trim(),
     };
     const images = attachedImages.map((a) => a.dataUrl);
+
+    const alreadyApproved = analyzeBtn.getAttribute('data-precheck-approved') === '1';
+    const precheck = assessLikelyNonInvestment(text, meta, images.length);
+    if (precheck.shouldWarn && !alreadyApproved) {
+      showPrecheckCard(precheck.reason);
+      toast('This may be non-investment content. Please confirm before analysis.', 'err');
+      return;
+    }
+
+    resetPrecheckApproval();
+    hidePrecheckCard();
+
+    analyzeBtn.disabled = true;
+    analyzeBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Analyzing…';
+    showState('loading'); cycleMsgs();
+    document.getElementById('analyze').scrollIntoView({ behavior: 'smooth', block: 'start' });
 
     // Handle the "not an investment" and generic error shapes the same way for
     // both the one-shot and chunked paths.
@@ -469,7 +771,11 @@
       } catch { /* assume unavailable */ }
 
       let result;
-      if (asyncJobs) {
+      if (images.length > IMAGE_BATCH_SIZE) {
+        // For large PDF/image submissions, send in loops of 10 images per request.
+        result = await runImageBatchPipeline(images, meta, handleErr);
+        if (result === null) return;
+      } else if (asyncJobs) {
         result = await runAsyncJob(text, images, meta, handleErr);
         if (result === null) return; // handled (e.g. not-an-investment notice)
       } else {
@@ -479,7 +785,12 @@
 
       renderResult(result);
       showState('content');
-      toast('Report ready', 'ok');
+      const used = incrementFreeUsage();
+      if (used >= FREE_LIMIT_PER_MONTH) {
+        toast('Report ready. You have reached your 3 free checks — upgrade to $9.95 Unlimited for more.', 'ok');
+      } else {
+        toast(`Report ready (${used}/${FREE_LIMIT_PER_MONTH} free checks used this month)`, 'ok');
+      }
     } catch (err) {
       showState('empty');
       toast(err.message || 'Something went wrong. Please try again.', 'err');

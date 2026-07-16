@@ -73,6 +73,11 @@ function clamp(v: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, v))
 }
 
+// Calibration guardrails to reduce false positives on non-investment or weak-evidence text.
+const MIN_TRIGGER_CONFIDENCE = 0.45
+const MIN_QUOTE_CHARS = 12
+const MIN_REASON_CHARS = 24
+
 function normalizeTier(t: any): string {
   const s = String(t || '').trim()
   const found = VALID_TIERS.find((v) => v.toLowerCase() === s.toLowerCase())
@@ -126,13 +131,15 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
   const allClaims: MergedDataset['claims'] = []
 
   for (const ev of clean) {
+    // Ignore rule scoring from chunks classified as non-investment-related.
+    if (ev?.is_investment_related !== true) continue
+
     const rules: RuleFinding[] = Array.isArray(ev.rules) ? ev.rules : []
     for (const r of rules) {
       const n = Number(r?.rule_id)
       if (!RULE_BY_N.has(n)) continue
       const a = acc.get(n)!
       const tier = normalizeTier(r?.evidence_tier)
-      const triggered = r?.triggered === true && tier !== 'GAP'
       const rank = TIER_RANK[tier] ?? 0
       const conf = clamp(Number(r?.confidence) || 0, 0, 1)
 
@@ -145,6 +152,15 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
           reason: String(e?.reason || '').trim(),
         }))
         .filter((e) => e.quote.length > 0 || e.reason.length > 0)
+
+      const hasConcreteEvidence = evItems.some(
+        (e) => e.quote.length >= MIN_QUOTE_CHARS || e.reason.length >= MIN_REASON_CHARS
+      )
+      const triggered =
+        r?.triggered === true &&
+        tier !== 'GAP' &&
+        conf >= MIN_TRIGGER_CONFIDENCE &&
+        hasConcreteEvidence
 
       if (triggered) {
         a.triggered = true
@@ -198,15 +214,22 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
   const totalWeightedPoints = triggered.reduce((s, f) => s + f.weightedPoints, 0)
   const maxPossiblePoints = triggered.reduce((s, f) => s + f.weight, 0)
 
-  // Stability floor: small numbers of flags shouldn't spike to 100% off one item.
-  const STABILITY_FLOOR = 40
-  const floorWeight = triggered.length >= 4 ? 0 : STABILITY_FLOOR * (1 - triggered.length / 4)
-  const denom = maxPossiblePoints + floorWeight
-  const riskScore = denom > 0 ? clamp(Math.round((totalWeightedPoints / denom) * 100), 0, 100) : 0
+  // If the material is not investment-related, force a neutral risk output.
+  const riskScore = !isInvestmentRelated
+    ? 0
+    : (() => {
+        // Stability floor: small numbers of flags shouldn't spike to 100% off one item.
+        const STABILITY_FLOOR = 40
+        const floorWeight = triggered.length >= 4 ? 0 : STABILITY_FLOOR * (1 - triggered.length / 4)
+        const denom = maxPossiblePoints + floorWeight
+        return denom > 0 ? clamp(Math.round((totalWeightedPoints / denom) * 100), 0, 100) : 0
+      })()
 
-  const keyDrivers = triggered
-    .filter((f) => maxPossiblePoints > 0 && f.weightedPoints / maxPossiblePoints >= 0.15)
-    .map((f) => f.n)
+  const keyDrivers = isInvestmentRelated
+    ? triggered
+        .filter((f) => maxPossiblePoints > 0 && f.weightedPoints / maxPossiblePoints >= 0.15)
+        .map((f) => f.n)
+    : []
 
   const riskLevel =
     riskScore >= 75 ? 'Critical' : riskScore >= 50 ? 'High' : riskScore >= 25 ? 'Medium' : 'Low'
