@@ -114,19 +114,34 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
   //  its risk factors, CIK, custodian, and LTV in DIFFERENT chunks.
   const invFamilies = new Set<number>()
   const legitFamilies = new Set<number>()
+  const ppmFamilies = new Set<number>()
+  const legalFamilies = new Set<number>()
   let anyLtv = false
   let anyLoss = false
+  let anyWaterfall = false
+  let anyAffirmativeGuarantee = false
   for (const e of clean) {
     const d = (e as any).det
     if (!d) continue
     for (const i of d.invFamilies || []) invFamilies.add(i)
     for (const i of d.legitFamilies || []) legitFamilies.add(i)
+    for (const i of d.ppmFamilies || []) ppmFamilies.add(i)
+    for (const i of d.legalFamilies || []) legalFamilies.add(i)
     if (d.hasLtv) anyLtv = true
     if (d.hasLoss) anyLoss = true
+    if (d.hasWaterfall) anyWaterfall = true
+    if (d.hasAffirmativeGuarantee) anyAffirmativeGuarantee = true
   }
   const investmentSignals = invFamilies.size
   const legitSignals = legitFamilies.size
-  const strongLegit = legitSignals >= 3
+  const ppmSignals = ppmFamilies.size
+  const legalSignals = legalFamilies.size
+  // A document is a formal PPM if it hits ≥4 PPM structure families AND ≥3 legal
+  // formality families — scam marketing pages never have this density.
+  const isFormalPPM = ppmSignals >= 4 && legalSignals >= 3
+  // Strong legitimacy: either ≥3 disclosure families (original gate) OR a formal
+  // PPM structure (new gate). Both suppress soft rules when no strong fraud signal.
+  const strongLegit = legitSignals >= 3 || isFormalPPM
 
   // ── Relevance gate (DETERMINISTIC) ──
   //  A document is investment-related iff it shows ≥3 distinct investment-vocab
@@ -136,7 +151,7 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
   //  pure function of the text. A rule that actually triggers on concrete
   //  evidence still forces relevance below (belt-and-suspenders).
   let isInvestmentRelated = clean.length > 0 && investmentSignals >= 3
-  console.log(`[mergeEvaluations] chunks=${clean.length} investmentSignals=${investmentSignals} legitSignals=${legitSignals} isInvestmentRelated=${isInvestmentRelated}`)
+  console.log(`[mergeEvaluations] chunks=${clean.length} investmentSignals=${investmentSignals} legitSignals=${legitSignals} ppmSignals=${ppmSignals} legalSignals=${legalSignals} isFormalPPM=${isFormalPPM} anyWaterfall=${anyWaterfall} isInvestmentRelated=${isInvestmentRelated}`)
 
   // ── Per-rule accumulator ──
   interface Acc {
@@ -228,6 +243,15 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
     const a = acc.get(16)
     if (a?.triggered) { a.triggered = false; console.log('[legit] rule#16 canceled: loss/risk disclosure present') }
   }
+  // Rule 6 ("guaranteed/risk-free") is canceled when NO chunk in the document
+  // contains affirmative guarantee language. If the LLM triggers rule 6 but the
+  // deterministic sentence-level detector found only NEGATED guarantees
+  // ("returns are not guaranteed", "no guarantee"), the LLM was wrong — the text
+  // is a disclaimer, not a fraud claim.
+  if (!anyAffirmativeGuarantee) {
+    const a = acc.get(6)
+    if (a?.triggered) { a.triggered = false; console.log('[legit] rule#6 canceled: no affirmative guarantee language in document (only negated disclaimers)') }
+  }
 
   // 2) Soft-rule suppression on well-disclosed docs — GUARDED against whitewash.
   //    Fires ONLY when the doc has NO strong (Tier 1/2) flag AND fewer than 2
@@ -237,7 +261,14 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
   // Structural-fraud rules (irrational ratios, debt/returns mismatch, internal
   // debt fund, co-GP double counting, asset overpayment) — the NRIA archetype.
   const STRUCTURAL_RULES = new Set([1, 3, 9, 12, 21])
-  const SOFT_RULES = new Set([11, 14, 15, 16, 18, 20])
+  // Soft / commonly-misfired rules — suppressed at Tier ≤3 on a WELL-DISCLOSED
+  // doc (guarded against whitewash below). Rule 19 (high-pressure) is included:
+  // a legit fund's single time-limited promo ("limited offer, bonus units") is
+  // mild marketing, not a blitz, and routinely false-positives here.
+  const SOFT_RULES = new Set([11, 14, 15, 16, 18, 19, 20])
+  // In a formal PPM with waterfall language, rule 2 at Tier ≤3 is almost
+  // certainly a waterfall breakpoint or preferred return, not a fraud promise.
+  if (isFormalPPM && anyWaterfall) SOFT_RULES.add(2)
   const triggeredEntries = () => Array.from(acc.entries()).filter(([, a]) => a.triggered)
   const strongNow = triggeredEntries().filter(([, a]) => (a.bestRank ?? 0) >= STRONG_RANK).length
   const structuralNow = triggeredEntries().filter(
@@ -290,17 +321,13 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
     : String(clean.find((e) => e.not_relevant_reason)?.not_relevant_reason || '') ||
       'This does not appear to be an investment offering, pitch, or solicitation.'
 
-  // Dispositive rules {4,5,6,8}: any ONE at Tier 3+ is independently conclusive
-  // of fraud and floors the score at Critical. Structural rules {1,3,9,12,21}
-  // are the NRIA archetype (irrational ratios, debt/returns mismatch, internal
-  // debt fund, co-GP double counting, asset overpayment): each is individually
-  // circumstantial (usually Tier 3), but ≥2 of them together (or one with high
-  // aggregate points) is serious fraud that must NOT be ceilinged to Low. A
-  // "strong" flag is any triggered rule at Tier 1/2. STRONG_RANK/STRUCTURAL_RULES
-  // are defined above in the suppression pass.
+  // Dispositive rules {4,5,6,8} (false FDIC, guaranteed/risk-free, barred, nominee)
+  // are independently conclusive of fraud → Critical floor. Structural rules
+  // {1,3,9,12,21} are the NRIA archetype (irrational ratios, debt/returns
+  // mismatch, internal debt fund, co-GP double counting, asset overpayment);
+  // ≥2 together → High floor. STRUCTURAL_RULES is defined above in the
+  // suppression pass.
   const DISPOSITIVE_RULES = new Set([4, 5, 6, 8])
-  const strongCount = triggered.filter((f) => (TIER_RANK[f.evidenceTier] ?? 0) >= STRONG_RANK).length
-  const hasStrongFlag = strongCount > 0
   const hasDispositiveHit = triggered.some(
     (f) => DISPOSITIVE_RULES.has(f.n) && (TIER_RANK[f.evidenceTier] ?? 0) >= 2
   )
@@ -308,33 +335,43 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
     (f) => STRUCTURAL_RULES.has(f.n) && (TIER_RANK[f.evidenceTier] ?? 0) >= 2
   ).length
   // Corroborated structural fraud: ≥2 structural rules, or 1 with high aggregate.
-  const hasStructuralCorroboration = structuralCount >= 2 || (structuralCount >= 1 && totalWeightedPoints >= 25)
+  const hasStructuralCorroboration = structuralCount >= 2 || (structuralCount >= 1 && totalWeightedPoints >= 18)
 
-  // If the material is not investment-related, force a neutral risk output.
+  // ── PROPORTIONAL COMPOSITE SCORE (deterministic port of the reference engine) ──
+  //  The reference IIE scores with:  Σ(severity × weight of triggered flags)
+  //                                  ÷ (Σ of ALL 21 weights × 10) × 100
+  //  but lets the LLM AUTHOR the number, so it is not reproducible run-to-run.
+  //  We compute the SAME proportion here in TypeScript. In our units,
+  //  totalWeightedPoints already equals Σ(round(weight × severity / 10)), so the
+  //  reference's ×10 cancels and the formula reduces to:
+  //        totalWeightedPoints ÷ Σ(all weights) × 100.
+  //
+  //  Why this fixes accuracy AND consistency: the denominator is a FIXED constant
+  //  (every document is scored against the same ceiling), so (a) the score grades
+  //  SMOOTHLY with how many red flags are present — like the reference's 66.7 —
+  //  instead of collapsing into flat bands, and (b) one extra or missing secondary
+  //  rule from DeepSeek is a small fraction of that fixed ceiling, so it moves the
+  //  score by only a point or two, never a jump across a level boundary.
+  //
+  //  CALIBRATION: the reference divides by Σ(all 21 weights)=176 — the points if
+  //  EVERY flag fired. No real document triggers all 21, so that compresses every
+  //  score into the low end. We divide by a realistic ceiling (~100 weighted
+  //  points ≈ a dozen serious flags at strong severity) so the full 0-100 range is
+  //  used and a broadly-fraudulent offering lands in High/Critical like the
+  //  reference's Spartan (66.7). Raise SCORE_CEILING if scores feel too hot, lower
+  //  it if they feel too cool — it is the single knob for overall sensitivity.
+  const SCORE_CEILING = 100
   const riskScore = !isInvestmentRelated
     ? 0
     : (() => {
-        // Stability floor: a handful of flags shouldn't spike to 100% off one item.
-        const STABILITY_FLOOR = 45
-        const ramp = Math.min(triggered.length, 3) / 3
-        const floorWeight = STABILITY_FLOOR * (1 - ramp)
-        const denom = maxPossiblePoints + floorWeight
-        let raw = denom > 0 ? clamp(Math.round((totalWeightedPoints / denom) * 100), 0, 100) : 0
-
-        // Dispositive fraud → Critical, graduated by corroboration (75..88) so a
-        // multi-signal scam scores higher than a single-signal one.
-        if (hasDispositiveHit) {
-          const floor = Math.min(88, 75 + 3 * Math.max(0, strongCount - 1) + 2 * Math.max(0, triggered.length - 1))
-          return Math.max(raw, floor)
-        }
-        // Corroborated structural fraud → at least High (60), even all-Tier-3.
-        if (hasStructuralCorroboration) raw = Math.max(raw, 60)
-        // Weak-only Low ceiling — the false-positive backstop for legit docs.
-        // Applied ONLY when there is neither a strong (Tier 1/2) flag NOR a
-        // corroborated structural fraud, so real frauds are never clamped but a
-        // legit doc's handful of weak/circumstantial misfires stay Low.
-        if (!hasStrongFlag && !hasStructuralCorroboration) raw = Math.min(raw, 24)
-        return raw
+        const base = clamp(Math.round((totalWeightedPoints / SCORE_CEILING) * 100), 0, 100)
+        // Deterministic floors so a terse-but-egregious offering cannot underscore
+        // merely because it is short (few flags → low proportion). These are the
+        // ONLY non-proportional adjustments and each is anchored to a deterministic
+        // signal (the regex backstop / structural corroboration).
+        if (hasDispositiveHit) return Math.max(base, 75)          // guaranteed / FDIC / barred / nominee → Critical
+        if (hasStructuralCorroboration) return Math.max(base, 55) // corroborated structural fraud → High
+        return base                                               // otherwise pure proportional gradation
       })()
 
   const keyDrivers = isInvestmentRelated

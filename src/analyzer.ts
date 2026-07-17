@@ -255,6 +255,8 @@ function normalizeChunkEval(raw: any, chunk: Chunk): ChunkEvaluation {
   //   • Tier 1 is reserved for primary-source docs — clamp it otherwise.
   //   • Confidence is snapped to a 0.1 ladder so jitter can't flip the gate.
   const primary = PRIMARY_SOURCE_RE.test(chunk.text)
+  const chunkLower = chunk.text.toLowerCase()
+  const rankOf = (t: string) => TIER_RANK[t] ?? 0
   // Ensure ALL 21 rules present.
   const rules: RuleFinding[] = FLAG_FRAMEWORK.map((def) => {
     const r = byId.get(def.n)
@@ -267,11 +269,24 @@ function normalizeChunkEval(raw: any, chunk: Chunk): ChunkEvaluation {
           reason: String(e?.reason || '').trim(),
         }))
       : []
+    let tier = canonicalTier(String(r?.evidence_tier || 'GAP'), primary)
+    // Rule 2 (high return) may only be a STRONG (Tier 1/2) signal when the chunk
+    // actually contains an explicit high FIXED/forward return that the
+    // deterministic pattern set recognizes. If the pattern does not match (modest
+    // returns like 9–11%) or only matches in a target/historical context, an LLM
+    // Tier-1/2 rule-2 is inference — cap it at Tier 3 so a past-performance figure
+    // or a modest target cannot masquerade as a strong fraud signal.
+    if (def.n === 2 && triggered && tier !== 'GAP') {
+      const r2 = BACKSTOP_RULES.find((b) => b.rule_id === 2)
+      const r2matches = !!r2 && r2.patterns.some((p) => p.test(chunkLower))
+      const ceiling = r2matches && r2 ? backstopTier(r2, chunkLower) : 'Tier 3'
+      if (rankOf(tier) > rankOf(ceiling)) tier = ceiling
+    }
     return {
       rule_id: def.n,
       triggered,
       confidence: snapConfidence(r?.confidence),
-      evidence_tier: canonicalTier(String(r?.evidence_tier || 'GAP'), primary) as any,
+      evidence_tier: tier as any,
       evidence,
     }
   })
@@ -284,6 +299,10 @@ function normalizeChunkEval(raw: any, chunk: Chunk): ChunkEvaluation {
     legitFamilies: matchedFamilies(chunk.text, LEGIT_DISCLOSURE_LEXICON),
     hasLtv: HAS_LTV_RE.test(chunk.text),
     hasLoss: HAS_LOSS_POS_RE.test(chunk.text) && !HAS_LOSS_NEG_RE.test(chunk.text),
+    ppmFamilies: matchedFamilies(chunk.text, PPM_STRUCTURE_LEXICON),
+    legalFamilies: matchedFamilies(chunk.text, LEGAL_FORMALITY_LEXICON),
+    hasWaterfall: WATERFALL_RE.test(chunk.text) || PREFERRED_RETURN_CONTEXT_RE.test(chunk.text),
+    hasAffirmativeGuarantee: detectAffirmativeGuarantee(chunk.text),
   }
 
   return {
@@ -326,6 +345,9 @@ const INVESTMENT_LEXICON: RegExp[] = [
 
 // Genuine-disclosure families. ≥3 DISTINCT families across the document marks a
 // well-disclosed offering, which deterministically suppresses weak/soft flags.
+// Broadened to recognize the disclosure language of legitimate FUND OVERVIEWS /
+// fact sheets (not just full PPMs) — the class that was false-positiving as
+// Medium (e.g. a multifamily fund with modest targets + full disclaimers).
 const LEGIT_DISCLOSURE_LEXICON: RegExp[] = [
   /past performance\b[^.]{0,40}\b(not|no)\b[^.]{0,20}(indicativ|guarante)/i,
   /\brisk factors?\b/i,
@@ -337,6 +359,51 @@ const LEGIT_DISCLOSURE_LEXICON: RegExp[] = [
   /\baudited\b[^.]{0,20}\bstatements?\b|\bindependent (registered )?(public )?(auditor|accounting)/i,
   /\b(qualified custodian|custodian|transfer agent|escrow agent)\b/i,
   /\bloan[- ]to[- ]value\b|\bltv\b[^.]{0,15}\d{1,3}\s*%|\bpurchase price\b|\bcap rate\b/i,
+  // ── fund-overview disclosure signals ──
+  /\breturns?\s+(are\s+)?not\s+guaranteed\b/i,
+  /\ball\s+investments?\b[^.]{0,25}\b(involve|includ)\w*\b[^.]{0,20}\brisk/i,
+  /\b(possible|potential|risk of|complete|partial)\b[^.]{0,20}\bloss of\b[^.]{0,20}(principal|capital|funds|investment)/i,
+  /\bnet asset value\b|\bnav\b\s+per\s+(unit|share)/i,
+  /\b(management|performance|acquisition|administrative)\s+fee|\bperformance allocation\b/i,
+  /\btarget(ed)?\b[^.]{0,80}(does\s*n'?t|do\s*not|not)\b[^.]{0,25}(represent|guarantee)\b[^.]{0,25}actual/i,
+]
+
+// ── PPM STRUCTURE DETECTOR ──
+// A formal PPM has dense legal structure that scams never replicate. ≥3 of these
+// families across the document marks it as a proper legal offering document.
+const PPM_STRUCTURE_LEXICON: RegExp[] = [
+  /\bprivate placement memorandum\b|\bconfidential\s+(private\s+)?placement\b/i,
+  /\bsubscription agreement\b/i,
+  /\blimited liability company agreement\b|\bllc agreement\b|\boperating agreement\b/i,
+  /\brisk factors?\b[^.]{0,20}(investment|company|property|units?|shares?)/i,
+  /\bpotential conflicts? of interest\b/i,
+  /\bcertain (u\.?s\.?\s+)?federal income tax\b|\btax considerations\b/i,
+  /\baccredited investor\b|\bregulation\s?d\b|\brule\s?506\b/i,
+  /\bexhibit\s+[a-z]\b/i,
+  /\b(hereby|herein|hereinafter|hereof|hereunder|pursuant to|notwithstanding)\b/i,
+  /\bsection\s+(i{1,3}v?|v?i{0,3}|[ivxlc]+)\b\s*[—–-]\s*/i,
+  /\bsecurities act of 1933\b|\binvestment company act\b|\bsecurities exchange act\b/i,
+  /\b(unitholder|shareholder|limited partner)\s*(s\b|'s\b|\b)/i,
+]
+
+// ── WATERFALL CONTEXT DETECTOR ──
+// Waterfall/distribution language: "15% IRR" in a waterfall is a breakpoint, not
+// a promise. When detected, rule 2 pattern matches on numbers in that range are
+// demoted further.
+const WATERFALL_RE = /\b(waterfall|distribution|distributable proceeds|profit share|catch[- ]?up|sponsor catch|pari passu)\b/i
+const PREFERRED_RETURN_CONTEXT_RE = /\bpreferred return\b.*\b\d{1,2}\s*%|\b\d{1,2}\s*%\s*preferred return\b/i
+
+// ── LEGAL FORMALITY DETECTOR ──
+// Dense legal boilerplate is a strong signal of a genuine legal document.
+const LEGAL_FORMALITY_LEXICON: RegExp[] = [
+  /\b(hereby|herein|hereinafter|hereof|hereunder)\b/i,
+  /\bpursuant to\b/i,
+  /\bnotwithstanding\b/i,
+  /\bin the sole (and absolute )?discretion\b/i,
+  /\b(representations?|warrant(y|ies)|covenants?)\b[^.]{0,30}\b(investor|unitholder|subscriber)/i,
+  /\bindemnif(y|ication)\b/i,
+  /\bgoverning law\b|\bjurisdiction\b/i,
+  /\bexhibit\s+[a-z]\b/i,
 ]
 
 // Rule 15 (no LTV/price disclosed) is nullified when ANY of these appear.
@@ -352,8 +419,54 @@ const PRIMARY_SOURCE_RE = /\b(form\s?d|private placement memorandum|\bppm\b|finr
 
 // Rule 2 projection guard: a high number labelled "target/projected/..." is not a
 // promise. It is injected at a WEAK tier so it cannot arm the strong-flag logic.
-const PROJECTION_RE = /\b(target(ed|ing)?|projected|illustrative|pro[- ]?forma|estimated|expected|up to|potential|anticipated)\b/i
-const FIXED_RE = /\b(fixed|guaranteed|guarantee|coupon|locked[- ]in)\b/i
+const PROJECTION_RE = /\b(target(ed|ing)?|projected|illustrative|pro[- ]?forma|estimated|expected|up to|potential|anticipated|preferred return|waterfall|profit share|catch[- ]?up|hurdle)\b/i
+const FIXED_RE = /\bfixed\s+(return|yield|rate|income|annual|coupon|interest)\b|\bcoupon\b|\blocked[- ]in\b|\bfixed\b.*\b(return|yield|rate)\b/i
+// "guaranteed/guarantee" only counts as FIXED when used affirmatively (not negated).
+const AFFIRM_GUARANTEE_RE = /\bguaranteed?\b/i
+const NEGATED_GUARANTEE_RE = /\b(not?|no|never|cannot|can'?t|without|aren'?t|isn'?t)\b[^.]{0,20}\bguaranteed?\b|\bguaranteed?\b[^.]{0,20}\b(not|no|never)\b|\bnot\s+be\s+guaranteed\b/i
+// Historical/track-record context: a PAST return (a performance table, a
+// "trailing 12-month", a prior-year figure) is not a promised return. When the
+// chunk is dominated by this language, a high % is disclosure, not a fraud claim.
+const HISTORICAL_RE = /\b(trailing|past performance|track record|year[- ]to[- ]date|\bytd\b|annualized return|net total return|since inception|as of \d|20\d\d\s*[:\s]|monthly net|historical performance|prior performance|realized|actual.*return)\b/i
+
+// Affirmative guarantee/risk-free patterns (sentence-level). These are the
+// POSITIVE signals that a chunk actually CLAIMS safety — not disclaimers.
+const AFFIRM_GUARANTEE_PATTERNS: RegExp[] = [
+  /\bguaranteed?\b.*\b(return|yield|income|profit)/i,
+  /\b(return|yield|income)\b.*\bguaranteed?\b/i,
+  /\brisk[- ]?free\b/i,
+  /\bminimal\s+risk\b/i,
+  /\bcapital\s+safeguard/i,
+  /\b100\s*%\s*(payback|repayment|principal|bond\s*payback)/i,
+  /\b100\s*%\s*(principal\s+)?protect(ed|ion)\b/i,
+  /\bsecure[,\s]+predictable\s+returns?\b/i,
+  /\bcannot\s+lose\b/i,
+  /\b(no|zero)\s+(chance|risk)\s+of\s+loss\b/i,
+  /\bloss[- ]free\b/i,
+  /\bcompletely\s+safe\b/i,
+]
+const GUARANTEE_DISCLAIMER_RE = /\b(not?|no|never|cannot|can'?t|without|aren'?t|isn'?t|don'?t|does\s*n'?t)\b[^.]{0,25}\bguaranteed?\b|\bguaranteed?\b[^.]{0,25}\b(not|no|never)\b|\breturn[s]?\s+(are\s+)?not\s+guaranteed\b|\bno\s+guarantee\b|\bcannot\s+be\s+guaranteed\b/i
+
+function detectAffirmativeGuarantee(text: string): boolean {
+  const sentences = text.split(/(?<=[.!?;])\s+/).filter(s => s.length > 5)
+  for (const s of sentences) {
+    // Check if any affirmative guarantee pattern matches THIS sentence
+    const hasGuaranteeLang = AFFIRM_GUARANTEE_PATTERNS.some(p => p.test(s))
+    if (!hasGuaranteeLang) continue
+    // Check guarantee-specific patterns — if the ONLY match is "guaranteed" and
+    // it's negated in this sentence, skip it.
+    const isGuaranteeWord = /\bguaranteed?\b/i.test(s)
+    if (isGuaranteeWord && GUARANTEE_DISCLAIMER_RE.test(s)) {
+      // "guaranteed" is negated in this sentence, but check if NON-guarantee
+      // patterns also match (risk-free, capital safeguard, etc.)
+      const nonGuaranteeHit = AFFIRM_GUARANTEE_PATTERNS.filter(p => !/guarante/i.test(p.source)).some(p => p.test(s))
+      if (nonGuaranteeHit) return true
+      continue
+    }
+    return true
+  }
+  return false
+}
 
 /** Distinct family indices from a lexicon that match the text. */
 function matchedFamilies(text: string, lexicon: RegExp[]): number[] {
@@ -386,7 +499,10 @@ interface PatternRule {
   tier: string
   confidence: number
   reason: string
+  negationGuard?: RegExp
 }
+
+const GUARANTEE_NEGATION_RE = /\b(not?|no|never|cannot|can'?t|without|aren'?t|isn'?t)\b[^.]{0,30}\bguaranteed?\b|\bguaranteed?\b[^.]{0,30}\b(not|no|never)\b|\breturn[s]?\s+(are\s+)?not\s+guaranteed\b|\bno\s+guarantee\b|\bcannot\s+be\s+guaranteed\b|\bnot\s+be\s+guaranteed\b/i
 
 const BACKSTOP_RULES: PatternRule[] = [
   {
@@ -404,6 +520,7 @@ const BACKSTOP_RULES: PatternRule[] = [
     tier: 'Tier 2',
     confidence: 0.92,
     reason: 'Deterministic pattern match: guaranteed/risk-free language detected in promoter material.',
+    negationGuard: GUARANTEE_NEGATION_RE,
   },
   {
     rule_id: 2,
@@ -448,17 +565,71 @@ const BACKSTOP_RULES: PatternRule[] = [
  * ("target/projected 20% IRR") rather than a FIXED/guaranteed coupon — so a
  * legitimate high-yield fund is not force-flagged as a strong signal.
  */
+function hasAffirmativeFixed(textLower: string): boolean {
+  if (FIXED_RE.test(textLower)) return true
+  if (AFFIRM_GUARANTEE_RE.test(textLower) && !NEGATED_GUARANTEE_RE.test(textLower)) return true
+  return false
+}
+
 function backstopTier(bp: PatternRule, textLower: string): string {
-  if (bp.rule_id === 2 && PROJECTION_RE.test(textLower) && !FIXED_RE.test(textLower)) {
-    return 'Tier 3'
+  if (bp.rule_id === 2) {
+    const isFixed = hasAffirmativeFixed(textLower)
+    const isProjectionOrHistorical = PROJECTION_RE.test(textLower) || HISTORICAL_RE.test(textLower)
+    const isWaterfall = WATERFALL_RE.test(textLower)
+    // A high % in waterfall context ("70/30 split until 15% IRR") or
+    // projection/historical context without a fixed-return claim is NOT a
+    // fraud promise → demote to weak tier.
+    if (!isFixed && (isProjectionOrHistorical || isWaterfall)) {
+      return 'Tier 3'
+    }
+    // Even with a "fixed" word, if it's purely in waterfall context
+    // (e.g. "10% preferred return"), demote — preferred returns are
+    // contractual distribution priorities, not guaranteed coupon promises.
+    if (isWaterfall && !(/\bguaranteed?\s+(return|yield|income)/i.test(textLower))) {
+      return 'Tier 3'
+    }
   }
   return bp.tier
+}
+
+// Split text into sentences for sentence-level negation checks. Simple split on
+// sentence-ending punctuation; good enough for legal/financial text.
+function extractSentences(text: string): string[] {
+  return text.split(/(?<=[.!?])\s+/).filter(s => s.length > 5)
+}
+
+// Check if a pattern match is affirmative (not negated) at the sentence level.
+// Returns true if at least one sentence matches the pattern WITHOUT negation.
+function hasAffirmativePatternMatch(text: string, patterns: RegExp[], negationRe: RegExp): boolean {
+  const sentences = extractSentences(text)
+  for (const sentence of sentences) {
+    if (patterns.some(p => p.test(sentence)) && !negationRe.test(sentence)) {
+      return true
+    }
+  }
+  return false
 }
 
 function injectIfMissing(rules: any[], textLower: string, chunk: Chunk): void {
   const rankOf = (t: string) => ({ 'Tier 1': 4, 'Tier 2': 3, 'Tier 3': 2, 'Tier 4': 1 }[t] || 0)
   for (const bp of BACKSTOP_RULES) {
-    const matched = bp.patterns.some(p => p.test(textLower))
+    let matched = bp.patterns.some(p => p.test(textLower))
+    if (!matched) continue
+    // For rules with negationGuard (rule 6): use SENTENCE-LEVEL negation.
+    // A scam might say "GUARANTEED 18% return" on page 1 and paste "returns
+    // are not guaranteed" on page 5. Chunk-level negation would wrongly suppress
+    // the real fraud signal. Sentence-level catches only actual disclaimers.
+    if (matched && bp.negationGuard) {
+      const guaranteePatterns = bp.patterns.filter(p => /guarante/i.test(p.source))
+      const nonGuaranteePatterns = bp.patterns.filter(p => !/guarante/i.test(p.source))
+      const nonGuaranteeHit = nonGuaranteePatterns.some(p => p.test(textLower))
+      if (!nonGuaranteeHit) {
+        // Only guarantee-based patterns matched. Check if ANY sentence has an
+        // affirmative (non-negated) guarantee match.
+        const affirmative = hasAffirmativePatternMatch(textLower, guaranteePatterns, bp.negationGuard)
+        if (!affirmative) matched = false
+      }
+    }
     if (!matched) continue
 
     const tier = backstopTier(bp, textLower)
@@ -747,7 +918,7 @@ export function assembleResult(merged: MergedDataset, report: FinalReport) {
 // Guarantees byte-identical output on re-upload of the SAME material, and cuts
 // cost to zero on repeats. PROMPT_VERSION MUST be bumped on any rules.ts prompt
 // or merge.ts scoring change so a stale cache never serves an old score.
-const PROMPT_VERSION = 'v6.1'
+const PROMPT_VERSION = 'v8.0'
 
 /** 64-bit FNV-1a (two streams) → collision-resistant hex cache key. */
 export function stableHash(s: string): string {
