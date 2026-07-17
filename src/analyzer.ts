@@ -283,6 +283,102 @@ function normalizeChunkEval(raw: any, chunk: Chunk): ChunkEvaluation {
   }
 }
 
+// ── Deterministic pattern-matching backstop ──────────────────────
+// These patterns catch dispositive fraud signals that DeepSeek inconsistently
+// detects. They only ADD or UPGRADE rules — they never remove LLM findings.
+// This makes scoring deterministic for the signals that matter most.
+
+interface PatternRule {
+  rule_id: number
+  patterns: RegExp[]
+  tier: string
+  confidence: number
+  reason: string
+}
+
+const BACKSTOP_RULES: PatternRule[] = [
+  {
+    rule_id: 6,
+    patterns: [
+      /\bguaranteed?\b.*\b(return|yield|income|profit)/i,
+      /\b(return|yield|income)\b.*\bguaranteed?\b/i,
+      /\brisk[- ]?free\b/i,
+      /\bminimal\s+risk\b/i,
+      /\bcapital\s+safeguard/i,
+      /\b100\s*%\s*(payback|repayment|principal|bond\s*payback)/i,
+      /\bsecure[,\s]+predictable\s+returns?\b/i,
+      /\bfixed\b.*\b(return|yield|coupon)\b.*\b(1[2-9]|[2-9]\d)\s*%/i,
+    ],
+    tier: 'Tier 2',
+    confidence: 0.92,
+    reason: 'Deterministic pattern match: guaranteed/risk-free language detected in promoter material.',
+  },
+  {
+    rule_id: 2,
+    patterns: [
+      /\b(1[7-9]|[2-9]\d)\s*%\s*(annual|yearly|fixed|irr|return|yield)\b/i,
+      /\b(annual|yearly|fixed|irr|return|yield)\s*(of\s*)?(1[7-9]|[2-9]\d)\s*%/i,
+      /\b16\s*%\s*(annual|yearly|fixed)\b/i,
+      /\b(annual|yearly|fixed)\s*(of\s*)?16\s*%/i,
+    ],
+    tier: 'Tier 2',
+    confidence: 0.90,
+    reason: 'Deterministic pattern match: return rate in Buffett-Shame Zone (≥16% fixed).',
+  },
+  {
+    rule_id: 10,
+    patterns: [
+      /utm_source\s*=\s*google_ads/i,
+      /gad_campaignid\s*=\s*\d{5,}/i,
+      /utm_source\s*=\s*facebook/i,
+      /fbclid\s*=/i,
+    ],
+    tier: 'Tier 2',
+    confidence: 0.95,
+    reason: 'Deterministic pattern match: mass advertising campaign parameters found in source URL.',
+  },
+  {
+    rule_id: 5,
+    patterns: [
+      /\bfdic\s+(insured|guaranteed|protected|backed)\b/i,
+      /\bsec\s+(qualified|approved|endorsed|registered)\b(?!.*\bnot\b)/i,
+      /\bsec\s+(has\s+)?approved\b/i,
+    ],
+    tier: 'Tier 2',
+    confidence: 0.95,
+    reason: 'Deterministic pattern match: false FDIC/SEC claim.',
+  },
+]
+
+function injectIfMissing(rules: any[], textLower: string, chunk: Chunk): void {
+  for (const bp of BACKSTOP_RULES) {
+    const matched = bp.patterns.some(p => p.test(textLower))
+    if (!matched) continue
+
+    const existing = rules.find((r: any) => Number(r?.rule_id) === bp.rule_id)
+    const rankOf = (t: string) => ({'Tier 1': 4, 'Tier 2': 3, 'Tier 3': 2, 'Tier 4': 1}[t] || 0)
+
+    if (!existing || !existing.triggered) {
+      // Inject the rule
+      const injected = {
+        rule_id: bp.rule_id,
+        triggered: true,
+        confidence: bp.confidence,
+        evidence_tier: bp.tier,
+        evidence: [{ page: chunk.startPage || 0, section: '', quote: '[pattern-matched]', reason: bp.reason }],
+      }
+      if (existing) Object.assign(existing, injected)
+      else rules.push(injected)
+      console.log(`[backstop] injected rule #${bp.rule_id} at ${bp.tier}`)
+    } else if (rankOf(bp.tier) > rankOf(existing.evidence_tier)) {
+      // Upgrade tier
+      console.log(`[backstop] upgraded rule #${bp.rule_id} from ${existing.evidence_tier} to ${bp.tier}`)
+      existing.evidence_tier = bp.tier
+      existing.confidence = Math.max(existing.confidence, bp.confidence)
+    }
+  }
+}
+
 /**
  * Evaluate ONE chunk against the 21 rules using the active provider's
  * strongest reasoning model. Returns a strict ChunkEvaluation.
@@ -307,56 +403,31 @@ export async function evaluateChunk(
     `MATERIAL TO EVALUATE:\n"""\n${chunk.text}\n"""\n\n` +
     `Consider all 21 rules against this chunk, but OUTPUT ONLY the rules that trigger. Return the JSON object only.`
 
-  // Double-evaluation: run two independent passes in parallel and merge the
-  // stronger result per rule. This stabilizes scores because the union of two
-  // non-deterministic passes catches more rules than either alone.
-  const sysPrompt = CHUNK_EVAL_PROMPT()
-  const [res1, res2] = await Promise.all([
-    provider.chatJson({ role: 'reason', systemPrompt: sysPrompt, userContent }),
-    provider.chatJson({ role: 'reason', systemPrompt: sysPrompt, userContent, forceModel: provider.modelFor('helper') }),
-  ])
+  const res = await provider.chatJson({
+    role: 'reason',
+    systemPrompt: CHUNK_EVAL_PROMPT(),
+    userContent,
+  })
+  console.log(`[evaluateChunk] chunk=${chunk.chunk_id} provider=${res.provider} model=${res.model} contentLen=${res.content?.length}`)
+  const raw = safeParseJson(res.content, res.finishReason)
 
-  console.log(`[evaluateChunk] pass1: provider=${res1.provider} model=${res1.model} contentLen=${res1.content?.length}`)
-  console.log(`[evaluateChunk] pass2: provider=${res2.provider} model=${res2.model} contentLen=${res2.content?.length}`)
+  // Deterministic backstop: pattern-match the chunk text for dispositive signals
+  // that DeepSeek inconsistently catches. If the text matches, inject/upgrade
+  // the rule so scoring never depends on LLM non-determinism.
+  const rulesArr: any[] = Array.isArray(raw?.rules) ? raw.rules : []
+  const textLower = chunk.text.toLowerCase()
+  injectIfMissing(rulesArr, textLower, chunk)
 
-  const raw1 = safeParseJson(res1.content, res1.finishReason)
-  const raw2 = safeParseJson(res2.content, res2.finishReason)
-
-  // Merge: take the union of triggered rules — strongest tier wins per rule.
-  const rules1: any[] = Array.isArray(raw1?.rules) ? raw1.rules : []
-  const rules2: any[] = Array.isArray(raw2?.rules) ? raw2.rules : []
-  const byId = new Map<number, any>()
-  for (const r of [...rules1, ...rules2]) {
-    const id = Number(r?.rule_id)
-    if (!id) continue
-    const existing = byId.get(id)
-    if (!existing) { byId.set(id, r); continue }
-    // Keep the one with higher tier rank or higher confidence
-    const rankOf = (t: string) => ({'Tier 1': 4, 'Tier 2': 3, 'Tier 3': 2, 'Tier 4': 1}[t] || 0)
-    const newRank = rankOf(r?.evidence_tier)
-    const oldRank = rankOf(existing?.evidence_tier)
-    if (r?.triggered && (!existing?.triggered || newRank > oldRank)) {
-      // Merge evidence arrays from both
-      const merged = [...(Array.isArray(existing?.evidence) ? existing.evidence : []), ...(Array.isArray(r?.evidence) ? r.evidence : [])]
-      byId.set(id, { ...r, evidence: merged })
-    } else if (existing?.triggered && !r?.triggered && Array.isArray(r?.evidence)) {
-      existing.evidence = [...(existing.evidence || []), ...r.evidence]
-    }
+  raw.rules = rulesArr
+  // If pattern matching found investment language, force relevance
+  if (raw?.is_investment_related !== true && rulesArr.some((r: any) => r?.triggered)) {
+    raw.is_investment_related = true
   }
 
-  const merged: any = {
-    chunk_id: raw1?.chunk_id ?? raw2?.chunk_id ?? chunk.chunk_id,
-    page_range: raw1?.page_range ?? raw2?.page_range,
-    is_investment_related: raw1?.is_investment_related || raw2?.is_investment_related,
-    not_relevant_reason: raw1?.not_relevant_reason || raw2?.not_relevant_reason || '',
-    rules: Array.from(byId.values()),
-    claims: [...(Array.isArray(raw1?.claims) ? raw1.claims : []), ...(Array.isArray(raw2?.claims) ? raw2.claims : [])],
-  }
+  const triggeredIds = rulesArr.filter((r: any) => r?.triggered).map((r: any) => r?.rule_id)
+  console.log(`[evaluateChunk] triggered_rules=${triggeredIds.join(',')}`)
 
-  const triggeredIds = merged.rules.filter((r: any) => r?.triggered).map((r: any) => r?.rule_id)
-  console.log(`[evaluateChunk] merged: is_investment_related=${merged.is_investment_related} triggered_rules=${triggeredIds.join(',')}`)
-
-  return normalizeChunkEval(merged, chunk)
+  return normalizeChunkEval(raw, chunk)
 }
 
 // ════════════════════════════════════════════════════════════════
