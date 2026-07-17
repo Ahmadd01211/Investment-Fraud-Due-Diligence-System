@@ -378,10 +378,10 @@ const OPENAI_DEFAULTS: Record<ModelRole, string> = {
 const OPENAI_VISION_FALLBACK_DEFAULT = 'gpt-5'
 
 const DEEPSEEK_DEFAULTS: Record<ModelRole, string> = {
-  reason: 'deepseek-v4-pro',
+  reason: 'deepseek-v4-flash',
   // DeepSeek is text-only; this "vision" slot is never used for OCR, but the
   // role map requires all three keys. Kept as the reasoning model as a no-op.
-  vision: 'deepseek-v4-pro',
+  vision: 'deepseek-v4-flash',
   helper: 'deepseek-v4-flash',
 }
 

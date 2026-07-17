@@ -307,16 +307,56 @@ export async function evaluateChunk(
     `MATERIAL TO EVALUATE:\n"""\n${chunk.text}\n"""\n\n` +
     `Consider all 21 rules against this chunk, but OUTPUT ONLY the rules that trigger. Return the JSON object only.`
 
-  const res = await provider.chatJson({
-    role: 'reason',
-    systemPrompt: CHUNK_EVAL_PROMPT(),
-    userContent,
-  })
-  console.log(`[evaluateChunk] chunk=${chunk.chunk_id} provider=${res.provider} model=${res.model} finishReason=${res.finishReason} contentLen=${res.content?.length}`)
-  console.log(`[evaluateChunk] raw response (first 500): ${String(res.content).slice(0, 500)}`)
-  const raw = safeParseJson(res.content, res.finishReason)
-  console.log(`[evaluateChunk] parsed: is_investment_related=${raw?.is_investment_related} (type=${typeof raw?.is_investment_related}) rules_count=${Array.isArray(raw?.rules) ? raw.rules.length : 'NOT_ARRAY'} triggered_rules=${Array.isArray(raw?.rules) ? raw.rules.filter((r: any) => r?.triggered).map((r: any) => r?.rule_id).join(',') : 'N/A'}`)
-  return normalizeChunkEval(raw, chunk)
+  // Double-evaluation: run two independent passes in parallel and merge the
+  // stronger result per rule. This stabilizes scores because the union of two
+  // non-deterministic passes catches more rules than either alone.
+  const sysPrompt = CHUNK_EVAL_PROMPT()
+  const [res1, res2] = await Promise.all([
+    provider.chatJson({ role: 'reason', systemPrompt: sysPrompt, userContent }),
+    provider.chatJson({ role: 'reason', systemPrompt: sysPrompt, userContent, forceModel: provider.modelFor('helper') }),
+  ])
+
+  console.log(`[evaluateChunk] pass1: provider=${res1.provider} model=${res1.model} contentLen=${res1.content?.length}`)
+  console.log(`[evaluateChunk] pass2: provider=${res2.provider} model=${res2.model} contentLen=${res2.content?.length}`)
+
+  const raw1 = safeParseJson(res1.content, res1.finishReason)
+  const raw2 = safeParseJson(res2.content, res2.finishReason)
+
+  // Merge: take the union of triggered rules — strongest tier wins per rule.
+  const rules1: any[] = Array.isArray(raw1?.rules) ? raw1.rules : []
+  const rules2: any[] = Array.isArray(raw2?.rules) ? raw2.rules : []
+  const byId = new Map<number, any>()
+  for (const r of [...rules1, ...rules2]) {
+    const id = Number(r?.rule_id)
+    if (!id) continue
+    const existing = byId.get(id)
+    if (!existing) { byId.set(id, r); continue }
+    // Keep the one with higher tier rank or higher confidence
+    const rankOf = (t: string) => ({'Tier 1': 4, 'Tier 2': 3, 'Tier 3': 2, 'Tier 4': 1}[t] || 0)
+    const newRank = rankOf(r?.evidence_tier)
+    const oldRank = rankOf(existing?.evidence_tier)
+    if (r?.triggered && (!existing?.triggered || newRank > oldRank)) {
+      // Merge evidence arrays from both
+      const merged = [...(Array.isArray(existing?.evidence) ? existing.evidence : []), ...(Array.isArray(r?.evidence) ? r.evidence : [])]
+      byId.set(id, { ...r, evidence: merged })
+    } else if (existing?.triggered && !r?.triggered && Array.isArray(r?.evidence)) {
+      existing.evidence = [...(existing.evidence || []), ...r.evidence]
+    }
+  }
+
+  const merged: any = {
+    chunk_id: raw1?.chunk_id ?? raw2?.chunk_id ?? chunk.chunk_id,
+    page_range: raw1?.page_range ?? raw2?.page_range,
+    is_investment_related: raw1?.is_investment_related || raw2?.is_investment_related,
+    not_relevant_reason: raw1?.not_relevant_reason || raw2?.not_relevant_reason || '',
+    rules: Array.from(byId.values()),
+    claims: [...(Array.isArray(raw1?.claims) ? raw1.claims : []), ...(Array.isArray(raw2?.claims) ? raw2.claims : [])],
+  }
+
+  const triggeredIds = merged.rules.filter((r: any) => r?.triggered).map((r: any) => r?.rule_id)
+  console.log(`[evaluateChunk] merged: is_investment_related=${merged.is_investment_related} triggered_rules=${triggeredIds.join(',')}`)
+
+  return normalizeChunkEval(merged, chunk)
 }
 
 // ════════════════════════════════════════════════════════════════
