@@ -156,6 +156,12 @@ Your methodology is built on Barry Minkow's documented investigative framework a
 THE 21 RULES (consider every one; output only those that fire):
 ${FLAG_FRAMEWORK.map((f) => `Rule ${f.n}: ${f.name}`).join('\n')}
 
+RULE-SPECIFIC GUIDANCE (apply carefully):
+  Rule 2: ANY fixed annual return ≥17% on a bond, fund, or note triggers this. "16% annual fixed yield" = triggers.
+  Rule 6: "Guaranteed/Risk-Free" includes IMPLIED guarantees — "fixed returns", "secure returns", "capital safeguard", "100% payback", "minimal risk", "predictable returns" all qualify. The word "guaranteed" does NOT need to appear literally. If the language systematically removes any perception of investment risk, this rule fires.
+  Rule 10: Google Ads UTM parameters (utm_source=google_ads), Facebook pixel IDs, or mass-media mentions prove mass advertising.
+  Rule 19: Multiple aggressive CTAs ("Book a meeting", "Request a callback", "Schedule now") concentrated in a short document = high-pressure sales.
+
 EVIDENCE TIER (pick the single best-fitting tier for each TRIGGERED rule):
   Tier 1 = primary-source / direct documentary proof (the PPM text itself, a Form D, a FINRA bar record, an audited statement).
   Tier 2 = strong secondary evidence (the promoter's own ad / brochure / website language quoted verbatim).
@@ -164,7 +170,9 @@ EVIDENCE TIER (pick the single best-fitting tier for each TRIGGERED rule):
 
 TRIGGERING RULES (follow exactly for determinism — the same chunk must always produce the same findings):
   • Output a rule ONLY when triggered=true — i.e. THIS CHUNK affirmatively contains problematic content (a bad claim, a contradiction, a prohibited practice). Assign the appropriate Tier 1–4.
-  • Never trigger a rule merely because something expected is ABSENT. Absence of a required disclosure is NOT a trigger — simply omit that rule (especially Rules 7, 11, 15, 16). Do NOT emit "GAP" rows.
+  • For most rules, trigger only on AFFIRMATIVE evidence (a bad claim, a contradiction, a prohibited practice).
+  • EXCEPTION — Rules 15 and 16 are ABSENCE rules by design: if the material is clearly an offering/pitch and it omits purchase price/LTV disclosure (Rule 15) or omits any mention of failed deals/losses (Rule 16), that omission IS the trigger. Use Tier 3 for absence-based triggers.
+  • Do NOT emit "GAP" rows or triggered=false rows.
   • If a rule does not fire in this chunk, OMIT it entirely from the "rules" array. Never output triggered=false rows.
   • Use the HIGHEST tier the evidence clearly supports; do not hedge between two tiers.
   • Only quote text that actually appears in the material of THIS chunk. Every evidence item MUST include the page number where it appears (use the [[PAGE n]] markers in the text; if none are present use 0).

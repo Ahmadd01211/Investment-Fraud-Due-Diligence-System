@@ -86,6 +86,7 @@ export interface OcrProvider {
 export interface ProviderConfig {
   apiKey: string
   baseUrl: string
+  providerName: string
   reasoningEffort?: string
   models: Record<ModelRole, string>
   /** Optional hard override: force ONE model for every role. */
@@ -143,23 +144,38 @@ class OpenAICompatibleProvider implements AIProvider {
   }
 
   private buildBody(model: string, req: ChatRequest): any {
-    const isReasoning = /^(gpt-5|o1|o3|o4)/i.test(model)
-    const reqBody: any = {
-      model,
-      messages: [
+    const isDeepSeek = this.cfg.providerName === 'deepseek'
+    const isOpenAIReasoning = /^(gpt-5|o1|o3|o4)/i.test(model)
+
+    const reqBody: any = { model }
+
+    if (isDeepSeek) {
+      // DeepSeek: use system + user messages. No temperature/seed — DeepSeek
+      // handles determinism internally. Large output budget so structured JSON
+      // isn't truncated.
+      reqBody.messages = [
+        { role: 'system', content: req.systemPrompt },
+        { role: 'user', content: typeof req.userContent === 'string' ? req.userContent : JSON.stringify(req.userContent) },
+      ]
+      reqBody.response_format = { type: 'json_object' }
+      reqBody.max_tokens = req.maxTokens || (req.role === 'reason' ? 16000 : 4000)
+    } else if (isOpenAIReasoning) {
+      reqBody.messages = [
         { role: 'system', content: req.systemPrompt },
         { role: 'user', content: req.userContent },
-      ],
-      response_format: { type: 'json_object' },
-      temperature: 0,
-      seed: 42,
-    }
-    if (isReasoning) {
-      reqBody.reasoning_effort = this.cfg.reasoningEffort || 'low'
+      ]
+      reqBody.response_format = { type: 'json_object' }
+      reqBody.reasoning_effort = this.cfg.reasoningEffort || 'high'
       reqBody.max_completion_tokens = 16000
     } else {
-      // Reasoning role gets a larger output budget (long structured JSON + report).
-      reqBody.max_tokens = req.maxTokens || (req.role === 'reason' ? 8000 : 4000)
+      reqBody.messages = [
+        { role: 'system', content: req.systemPrompt },
+        { role: 'user', content: req.userContent },
+      ]
+      reqBody.response_format = { type: 'json_object' }
+      reqBody.temperature = 0
+      reqBody.seed = 42
+      reqBody.max_tokens = req.maxTokens || (req.role === 'reason' ? 16000 : 4000)
     }
     return reqBody
   }
@@ -221,8 +237,11 @@ class OpenAICompatibleProvider implements AIProvider {
       throw classifyUpstreamError(resp.status, txt)
     }
     const data: any = await resp.json()
-    const content = data?.choices?.[0]?.message?.content
+    const msg = data?.choices?.[0]?.message
+    // DeepSeek reasoning models may put output in `reasoning_content` with empty `content`.
+    const content = msg?.content || msg?.reasoning_content || ''
     const finishReason = data?.choices?.[0]?.finish_reason ?? null
+    console.log(`[provider:${this.name}] model=${model} finish=${finishReason} contentLen=${content.length} hasReasoning=${!!msg?.reasoning_content} keys=${msg ? Object.keys(msg).join(',') : 'null'}`)
     if (!content) throw new Error('Analysis service returned an empty response.')
     return { content, finishReason, model, provider: this.name }
   }
@@ -375,6 +394,7 @@ function buildOpenAI(env: ProviderEnv): AIProvider {
   return new OpenAICompatibleProvider('openai', {
     apiKey: env.OPENAI_API_KEY as string,
     baseUrl: (env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, ''),
+    providerName: 'openai',
     reasoningEffort: env.OPENAI_REASONING_EFFORT,
     forceModel: env.OPENAI_MODEL,
     supportsVision: true,
@@ -391,6 +411,7 @@ function buildDeepSeek(env: ProviderEnv): AIProvider {
   return new OpenAICompatibleProvider('deepseek', {
     apiKey: env.DEEPSEEK_API_KEY as string,
     baseUrl: (env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1').replace(/\/$/, ''),
+    providerName: 'deepseek',
     reasoningEffort: env.DEEPSEEK_REASONING_EFFORT,
     forceModel: env.DEEPSEEK_MODEL,
     supportsVision: false, // DeepSeek's API is text-only — never send it images

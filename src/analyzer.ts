@@ -214,10 +214,15 @@ export function splitDocument(env: Bindings, text: string): { chunks: Chunk[] } 
 // ════════════════════════════════════════════════════════════════
 
 function safeParseJson(content: string, finishReason: string | null): any {
-  const trimmed = String(content).trim()
+  let trimmed = String(content).trim()
   if (finishReason === 'length') {
     throw new Error('RESPONSE_TRUNCATED: The model response was cut off due to size limits. Reduce non-essential content and retry.')
   }
+  // DeepSeek reasoning models may wrap output in <think>...</think> tags — strip them.
+  trimmed = trimmed.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
+  // Strip markdown code fences (```json ... ```)
+  trimmed = trimmed.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim()
+
   const looksJson = trimmed.startsWith('{') || trimmed.startsWith('[') || /\{[\s\S]*\}/.test(trimmed)
   if (!looksJson) {
     const lower = trimmed.toLowerCase()
@@ -246,7 +251,7 @@ function normalizeChunkEval(raw: any, chunk: Chunk): ChunkEvaluation {
   // Ensure ALL 21 rules present.
   const rules: RuleFinding[] = FLAG_FRAMEWORK.map((def) => {
     const r = byId.get(def.n)
-    const triggered = r?.triggered === true
+    const triggered = r?.triggered === true || String(r?.triggered).toLowerCase() === 'true'
     const evidence = Array.isArray(r?.evidence)
       ? r.evidence.map((e: any) => ({
           page: Math.max(0, Number(e?.page) || chunk.startPage || 0),
@@ -266,8 +271,12 @@ function normalizeChunkEval(raw: any, chunk: Chunk): ChunkEvaluation {
   return {
     chunk_id: chunk.chunk_id,
     page_range: [chunk.startPage || 0, chunk.endPage || 0],
-    // Strict parsing: only explicit true counts as investment-related.
-    is_investment_related: raw?.is_investment_related === true,
+    // Accept boolean true, string "true", or 1 — DeepSeek sometimes returns strings.
+    // If rules were triggered, it's investment-related regardless of what the model said.
+    is_investment_related: raw?.is_investment_related === true
+      || String(raw?.is_investment_related).toLowerCase() === 'true'
+      || rulesIn.some((r: any) => r?.triggered === true || String(r?.triggered).toLowerCase() === 'true')
+      || (raw?.is_investment_related == null && rulesIn.length > 0),
     not_relevant_reason: String(raw?.not_relevant_reason || ''),
     rules,
     claims: Array.isArray(raw?.claims) ? raw.claims : [],
@@ -303,7 +312,10 @@ export async function evaluateChunk(
     systemPrompt: CHUNK_EVAL_PROMPT(),
     userContent,
   })
+  console.log(`[evaluateChunk] chunk=${chunk.chunk_id} provider=${res.provider} model=${res.model} finishReason=${res.finishReason} contentLen=${res.content?.length}`)
+  console.log(`[evaluateChunk] raw response (first 500): ${String(res.content).slice(0, 500)}`)
   const raw = safeParseJson(res.content, res.finishReason)
+  console.log(`[evaluateChunk] parsed: is_investment_related=${raw?.is_investment_related} (type=${typeof raw?.is_investment_related}) rules_count=${Array.isArray(raw?.rules) ? raw.rules.length : 'NOT_ARRAY'} triggered_rules=${Array.isArray(raw?.rules) ? raw.rules.filter((r: any) => r?.triggered).map((r: any) => r?.rule_id).join(',') : 'N/A'}`)
   return normalizeChunkEval(raw, chunk)
 }
 

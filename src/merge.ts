@@ -117,6 +117,7 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
   const relevantVotes = clean.filter((e) => e.is_investment_related === true).length
   const relevanceThreshold = Math.max(1, Math.ceil(clean.length * 0.25))
   let isInvestmentRelated = clean.length > 0 && relevantVotes >= relevanceThreshold
+  console.log(`[mergeEvaluations] chunks=${clean.length} relevantVotes=${relevantVotes} threshold=${relevanceThreshold} isInvestmentRelated=${isInvestmentRelated}`)
 
   // ── Per-rule accumulator ──
   interface Acc {
@@ -264,6 +265,8 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
 
   const riskLevel =
     riskScore >= 75 ? 'Critical' : riskScore >= 50 ? 'High' : riskScore >= 25 ? 'Medium' : 'Low'
+  console.log(`[mergeEvaluations] FINAL: triggeredCount=${triggered.length} totalWeightedPoints=${totalWeightedPoints} maxPossiblePoints=${maxPossiblePoints} hasDispositiveHit=${hasDispositiveHit} riskScore=${riskScore} riskLevel=${riskLevel}`)
+  triggered.forEach(f => console.log(`[mergeEvaluations]   rule#${f.n} ${f.name} tier=${f.evidenceTier} sev=${f.severity} wp=${f.weightedPoints} conf=${f.confidence}`))
 
   // Dedupe claims.
   const seenClaims = new Set<string>()
