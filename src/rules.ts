@@ -489,6 +489,39 @@ These words mean different things depending on context. Always read the surround
   • "Loss of principal" → risk warning → NO rule fires
 
 ═══════════════════════════════════════════════════════════════════
+SKILL 8: COMMON FALSE-NEGATIVE TRAPS (rules you SHOULD fire but miss)
+═══════════════════════════════════════════════════════════════════
+False negatives are JUST AS DANGEROUS as false positives. When a scam slips through, real people lose money. Be thorough — evaluate ALL 21 rules, not just the most obvious ones.
+
+TRAP A — Stopping after finding 2-3 rules:
+  WRONG: You find Rule 2 and Rule 6, then stop looking.
+  RIGHT: ALWAYS evaluate ALL 21 rules on every chunk. A scam that triggers Rule 2 + Rule 6 likely ALSO triggers Rule 9, 10, 15, 19, or others. Each additional rule adds evidence. Do not stop early.
+
+TRAP B — Missing vertical integration (Rule 9):
+  When you see MULTIPLE entities that all share the same parent/brand name (e.g. "AIX Wealth Limited" as arranger, "AIX Debt Capital" as issuer, "AIX Financial" as placement agent), that IS vertical integration — the same group controls the fundraising, the fund structure, AND the deployment of capital. This creates massive conflict-of-interest and is a hallmark of Ponzi-like structures where investor money flows in circles within one group. Rule 9 fires.
+  ALSO: When a fund uses an INTERNAL debt fund to lend to its OWN projects (the fund raises equity from investors, then lends it to the fund's own real estate entities as debt), that IS vertical integration into an internal debt fund. Rule 9 fires.
+
+TRAP C — Missing absent disclosures (Rule 15):
+  Rule 15 is an ABSENCE rule. If a document promises high returns but NEVER discloses: what assets generate those returns, what the purchase prices are, what the LTV is, what the cap rates are — that IS concealment. A bond promising 16% fixed yield with NO disclosure of underlying asset details is FAR more suspicious than a fund that discloses everything.
+  KEY: Do NOT confuse "the document doesn't mention LTV" with "LTV is disclosed elsewhere." If THIS CHUNK is an offering/pitch and it contains NO asset-level detail, Rule 15 fires at Tier 3.
+  EXCEPTION: A brief marketing OVERVIEW that says "See PPM for details" or "See Fund Documents" gets a pass — the detail is deferred to the full offering doc, which is normal.
+
+TRAP D — Missing high-pressure sales (Rule 19):
+  Count the CTAs. If you find ≥2 of these in the SAME document: "Request a Callback," "Schedule a Meeting," "Book Now," "Contact Us Today," "Learn More" (when paired with other CTAs), "Invest Now," "Get Started," countdown timers, "only X spots left," "limited availability" — that IS high-pressure. Don't dismiss them individually; evaluate the DENSITY of selling pressure across the whole chunk.
+  ALSO: "How It Works" funnels (Step 1: Schedule a meeting → Step 2: Subscribe → Step 3: Get paid) ARE selling pressure when they frame the investment as a simple, inevitable process.
+
+TRAP E — Missing mass advertising (Rule 10):
+  Look for ANY of these: utm_source=google, utm_source=facebook, utm_campaign=, gad_source=, gad_campaignid=, fbclid=, gclid=, pixel IDs, "as seen on TV," "featured in Forbes/Bloomberg" (when it's a paid feature), radio/podcast ad transcripts. Even ONE UTM parameter in a URL is PRIMARY SOURCE evidence (Tier 1) of mass advertising.
+
+TRAP F — Missing no-failed-deal disclosure (Rule 16):
+  If the offering/pitch shows ONLY positive returns, ONLY success stories, ONLY upside — and never mentions a single loss, failed deal, down year, impairment, or write-off — that IS Rule 16. Legitimate track records include bad years.
+
+TRAP G — Missing concealed addresses (Rule 7):
+  If a real estate offering describes properties vaguely ("a premier property in the Southeast" or "multifamily assets in growing markets") without specific addresses, that IS concealment. Legitimate offerings name the street address.
+
+THOROUGHNESS INSTRUCTION: After evaluating the chunk, do a final pass — ask yourself: "Are there any rules from 1-21 that I considered but didn't fire because I wasn't sure?" If the evidence is at confidence ≥0.7, fire the rule. Err on the side of flagging — the merge layer can suppress weak findings, but it CANNOT add rules you failed to report.
+
+═══════════════════════════════════════════════════════════════════
 THE 21 RULES (consider every one; output only those that fire):
 ═══════════════════════════════════════════════════════════════════
 ${FLAG_FRAMEWORK.map((f) => `Rule ${f.n}: ${f.name}`).join('\n')}
@@ -496,8 +529,10 @@ ${FLAG_FRAMEWORK.map((f) => `Rule ${f.n}: ${f.name}`).join('\n')}
 RULE-SPECIFIC GUIDANCE (apply carefully):
   Rule 2: A FIXED or GUARANTEED annual coupon/yield ≥16%, or a stated REALIZED IRR ≥17%, triggers this. "16% annual fixed yield" = triggers. A number labelled "target", "projected", "illustrative", "pro forma", "up to", "expected", or "anticipated" is a PROJECTION — do NOT trigger Rule 2 on a projection alone. A "preferred return" (e.g. "7% preferred return", "10% preferred return") is a CONTRACTUAL DISTRIBUTION PRIORITY in a waterfall, NOT a guaranteed coupon — do NOT trigger. A WATERFALL BREAKPOINT (e.g. "70/30 split until 15% IRR is achieved, then 50/50") is a profit-sharing threshold, NOT a promised return — do NOT trigger.
   Rule 6: "Guaranteed/Risk-Free" includes IMPLIED guarantees — "fixed returns", "secure returns", "capital safeguard", "100% payback", "minimal risk", "predictable returns" all qualify. The word "guaranteed" does NOT need to appear literally. Rule 6 fires ONLY on language that REMOVES the perception of risk. Standard risk disclosure is the OPPOSITE and must NOT trigger it (see DO-NOT-TRIGGER GUARDS).
-  Rule 10: Google Ads UTM parameters (utm_source=google_ads), Facebook pixel IDs, or mass-media mentions prove mass advertising.
-  Rule 19: Multiple aggressive CTAs ("Book a meeting", "Request a callback", "Schedule now") concentrated in a short document = high-pressure sales.
+  Rule 9: Vertical integration = when MULTIPLE entities under the SAME parent/brand control different parts of the fund structure (issuer, arranger, placement agent, manager, lender). Also fires when a fund lends to its own affiliated projects through an internal debt vehicle. Look for entity names sharing a common brand prefix (e.g. "XYZ Capital," "XYZ Wealth," "XYZ Financial" are all "XYZ" entities).
+  Rule 10: Google Ads UTM parameters (utm_source=google_ads), Facebook pixel IDs, gclid, fbclid, or mass-media mentions prove mass advertising. A SINGLE UTM parameter in any URL = Tier 1 evidence.
+  Rule 15: This is an ABSENCE rule. Fire when an offering/pitch contains NO purchase price, NO appraisal, NO LTV, NO cap-rate figures for the underlying assets. A bond or fund promising specific returns with NO disclosure of what assets generate those returns = Rule 15 fires at Tier 3. However, do NOT fire on a brief marketing overview that directs readers to full offering documents.
+  Rule 19: Multiple aggressive CTAs ("Book a meeting", "Request a callback", "Schedule now", "Contact us") concentrated in a document = high-pressure sales. Count them — ≥2 distinct CTAs pushing toward a sales interaction qualifies. Also: "How it works" step-by-step funnels that frame investing as a simple 3-step process are selling pressure.
 
 DO-NOT-TRIGGER GUARDS (obey exactly — these prevent false positives on legitimate offerings):
   Rule 6: Standard risk disclosure is a NEGATIVE signal — do NOT trigger on "past performance is not indicative", "investments involve risk", "you may lose your principal", "returns are not guaranteed", "speculative and illiquid", or on "target"/"projected" returns. Rule 6 fires ONLY on language that REMOVES risk ("guaranteed", "risk-free", "principal protected", "capital safeguard", "cannot lose") with NO offsetting disclaimer in the same chunk.

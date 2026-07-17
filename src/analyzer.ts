@@ -918,7 +918,7 @@ export function assembleResult(merged: MergedDataset, report: FinalReport) {
 // Guarantees byte-identical output on re-upload of the SAME material, and cuts
 // cost to zero on repeats. PROMPT_VERSION MUST be bumped on any rules.ts prompt
 // or merge.ts scoring change so a stale cache never serves an old score.
-const PROMPT_VERSION = 'v8.0'
+const PROMPT_VERSION = 'v8.1'
 
 /** 64-bit FNV-1a (two streams) → collision-resistant hex cache key. */
 export function stableHash(s: string): string {
