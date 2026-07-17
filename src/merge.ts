@@ -107,17 +107,36 @@ function dedupeEvidence(items: MergedEvidence[]): MergedEvidence[] {
 export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
   const clean = (Array.isArray(evals) ? evals : []).filter((e) => e && typeof e === 'object')
 
-  // ── Relevance gate ──
-  //  A long document is split into many semantic chunks; dry legal/boilerplate
-  //  sections (definitions, financial tables, subscription terms) can each look
-  //  "non-investment" in isolation, so a strict MAJORITY vote wrongly zeros out
-  //  a valid PPM. Require only a meaningful SHARE of chunks (≥25%, min 1). The
-  //  stronger signal — any rule that actually triggered on concrete evidence —
-  //  forces relevance below, once findings are computed.
-  const relevantVotes = clean.filter((e) => e.is_investment_related === true).length
-  const relevanceThreshold = Math.max(1, Math.ceil(clean.length * 0.25))
-  let isInvestmentRelated = clean.length > 0 && relevantVotes >= relevanceThreshold
-  console.log(`[mergeEvaluations] chunks=${clean.length} relevantVotes=${relevantVotes} threshold=${relevanceThreshold} isInvestmentRelated=${isInvestmentRelated}`)
+  // ── Deterministic document-level detectors (pure function of the bytes) ──
+  //  Union the investment-vocabulary and legitimate-disclosure family hits that
+  //  analyzer.ts stamped onto each chunk (ChunkEvaluation.det). Computing these
+  //  at the DOCUMENT level (not per-chunk) is essential: a multi-chunk PPM keeps
+  //  its risk factors, CIK, custodian, and LTV in DIFFERENT chunks.
+  const invFamilies = new Set<number>()
+  const legitFamilies = new Set<number>()
+  let anyLtv = false
+  let anyLoss = false
+  for (const e of clean) {
+    const d = (e as any).det
+    if (!d) continue
+    for (const i of d.invFamilies || []) invFamilies.add(i)
+    for (const i of d.legitFamilies || []) legitFamilies.add(i)
+    if (d.hasLtv) anyLtv = true
+    if (d.hasLoss) anyLoss = true
+  }
+  const investmentSignals = invFamilies.size
+  const legitSignals = legitFamilies.size
+  const strongLegit = legitSignals >= 3
+
+  // ── Relevance gate (DETERMINISTIC) ──
+  //  A document is investment-related iff it shows ≥3 distinct investment-vocab
+  //  families. The old gate counted the LLM's non-deterministic
+  //  is_investment_related votes, which flipped the SAME legit document between
+  //  0% (voted not-related → force-zeroed) and 53% across runs. This gate is a
+  //  pure function of the text. A rule that actually triggers on concrete
+  //  evidence still forces relevance below (belt-and-suspenders).
+  let isInvestmentRelated = clean.length > 0 && investmentSignals >= 3
+  console.log(`[mergeEvaluations] chunks=${clean.length} investmentSignals=${investmentSignals} legitSignals=${legitSignals} isInvestmentRelated=${isInvestmentRelated}`)
 
   // ── Per-rule accumulator ──
   interface Acc {
@@ -135,9 +154,10 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
   const allClaims: MergedDataset['claims'] = []
 
   for (const ev of clean) {
-    // Ignore rule scoring from chunks classified as non-investment-related.
-    if (ev?.is_investment_related !== true) continue
-
+    // Accumulate rules from EVERY chunk. The rule-level trigger gate below
+    // (confidence ≥ floor, tier ≠ GAP, concrete evidence) filters noise, so we
+    // no longer drop a chunk's rules on the flaky per-chunk LLM relevance vote —
+    // that OR-in was a residual source of run-to-run score flips.
     const rules: RuleFinding[] = Array.isArray(ev.rules) ? ev.rules : []
     for (const r of rules) {
       const n = Number(r?.rule_id)
@@ -192,6 +212,48 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
     }
   }
 
+  // ── Deterministic false-positive suppression (pre-scoring) ──
+  //  Legitimate offerings previously drifted to Medium/High off weak, jittery
+  //  flags. These deterministic corrections keep a well-disclosed doc LOW.
+
+  // 1) Absence-rule cancellation — factual, applied unconditionally. A disclosed
+  //    LTV/price makes rule 15 ("no LTV disclosed") false; genuine loss/risk
+  //    disclosure makes rule 16 ("no failed-deal disclosure") false. (hasLoss
+  //    already excludes negated whitewash like "zero chance of loss".)
+  if (anyLtv) {
+    const a = acc.get(15)
+    if (a?.triggered) { a.triggered = false; console.log('[legit] rule#15 canceled: LTV/price disclosed') }
+  }
+  if (anyLoss) {
+    const a = acc.get(16)
+    if (a?.triggered) { a.triggered = false; console.log('[legit] rule#16 canceled: loss/risk disclosure present') }
+  }
+
+  // 2) Soft-rule suppression on well-disclosed docs — GUARDED against whitewash.
+  //    Fires ONLY when the doc has NO strong (Tier 1/2) flag AND fewer than 2
+  //    structural-fraud rules, so a real scam that merely pastes boilerplate
+  //    disclaimers can never soften its own strong or structural evidence.
+  const STRONG_RANK = TIER_RANK['Tier 2'] ?? 3
+  // Structural-fraud rules (irrational ratios, debt/returns mismatch, internal
+  // debt fund, co-GP double counting, asset overpayment) — the NRIA archetype.
+  const STRUCTURAL_RULES = new Set([1, 3, 9, 12, 21])
+  const SOFT_RULES = new Set([11, 14, 15, 16, 18, 20])
+  const triggeredEntries = () => Array.from(acc.entries()).filter(([, a]) => a.triggered)
+  const strongNow = triggeredEntries().filter(([, a]) => (a.bestRank ?? 0) >= STRONG_RANK).length
+  const structuralNow = triggeredEntries().filter(
+    ([n, a]) => STRUCTURAL_RULES.has(n) && (a.bestRank ?? 0) >= 2
+  ).length
+  const suppressionAllowed = strongLegit && strongNow === 0 && structuralNow < 2
+  if (suppressionAllowed) {
+    for (const n of SOFT_RULES) {
+      const a = acc.get(n)
+      if (a?.triggered && (a.bestRank ?? 0) <= (TIER_RANK['Tier 3'] ?? 2)) {
+        a.triggered = false
+        console.log(`[legit] rule#${n} suppressed (well-disclosed, no strong/structural fraud signal)`)
+      }
+    }
+  }
+
   // ── Build merged findings + deterministic scoring ──
   const findings: MergedFinding[] = FLAG_FRAMEWORK.map((rule) => {
     const a = acc.get(rule.n)!
@@ -228,33 +290,51 @@ export function mergeEvaluations(evals: ChunkEvaluation[]): MergedDataset {
     : String(clean.find((e) => e.not_relevant_reason)?.not_relevant_reason || '') ||
       'This does not appear to be an investment offering, pitch, or solicitation.'
 
-  // Dispositive rules: barred promoter, false FDIC / regulatory claim,
-  // "guaranteed / risk-free" returns, nominee concealment. A single one of these
-  // is independently conclusive of fraud, so it floors the score at Critical (75).
-  //
-  // We accept Tier 1 (documentary) OR Tier 2/Tier 3 evidence — NOT just Tier 1.
-  // The most dangerous claims almost always appear as the promoter's OWN marketing
-  // language (ads, landing pages, emails), which the tier rubric classifies as
-  // "Tier 2" at best and NEVER "Tier 1" (that tier is reserved for a PPM / Form D /
-  // FINRA record). Gating on Tier 1 alone made this override dead code for the most
-  // common upload types — a "guaranteed 16% risk-free" website would slip through
-  // as Low. `triggered` already requires a concrete verbatim quote above the
-  // confidence floor, so rank >= Tier 3 is real evidence, not pure inference (Tier 4).
+  // Dispositive rules {4,5,6,8}: any ONE at Tier 3+ is independently conclusive
+  // of fraud and floors the score at Critical. Structural rules {1,3,9,12,21}
+  // are the NRIA archetype (irrational ratios, debt/returns mismatch, internal
+  // debt fund, co-GP double counting, asset overpayment): each is individually
+  // circumstantial (usually Tier 3), but ≥2 of them together (or one with high
+  // aggregate points) is serious fraud that must NOT be ceilinged to Low. A
+  // "strong" flag is any triggered rule at Tier 1/2. STRONG_RANK/STRUCTURAL_RULES
+  // are defined above in the suppression pass.
   const DISPOSITIVE_RULES = new Set([4, 5, 6, 8])
+  const strongCount = triggered.filter((f) => (TIER_RANK[f.evidenceTier] ?? 0) >= STRONG_RANK).length
+  const hasStrongFlag = strongCount > 0
   const hasDispositiveHit = triggered.some(
     (f) => DISPOSITIVE_RULES.has(f.n) && (TIER_RANK[f.evidenceTier] ?? 0) >= 2
   )
+  const structuralCount = triggered.filter(
+    (f) => STRUCTURAL_RULES.has(f.n) && (TIER_RANK[f.evidenceTier] ?? 0) >= 2
+  ).length
+  // Corroborated structural fraud: ≥2 structural rules, or 1 with high aggregate.
+  const hasStructuralCorroboration = structuralCount >= 2 || (structuralCount >= 1 && totalWeightedPoints >= 25)
 
   // If the material is not investment-related, force a neutral risk output.
   const riskScore = !isInvestmentRelated
     ? 0
     : (() => {
-        // Stability floor: small numbers of flags shouldn't spike to 100% off one item.
-        const STABILITY_FLOOR = 40
-        const floorWeight = triggered.length >= 4 ? 0 : STABILITY_FLOOR * (1 - triggered.length / 4)
+        // Stability floor: a handful of flags shouldn't spike to 100% off one item.
+        const STABILITY_FLOOR = 45
+        const ramp = Math.min(triggered.length, 3) / 3
+        const floorWeight = STABILITY_FLOOR * (1 - ramp)
         const denom = maxPossiblePoints + floorWeight
-        const raw = denom > 0 ? clamp(Math.round((totalWeightedPoints / denom) * 100), 0, 100) : 0
-        return hasDispositiveHit ? Math.max(raw, 75) : raw
+        let raw = denom > 0 ? clamp(Math.round((totalWeightedPoints / denom) * 100), 0, 100) : 0
+
+        // Dispositive fraud → Critical, graduated by corroboration (75..88) so a
+        // multi-signal scam scores higher than a single-signal one.
+        if (hasDispositiveHit) {
+          const floor = Math.min(88, 75 + 3 * Math.max(0, strongCount - 1) + 2 * Math.max(0, triggered.length - 1))
+          return Math.max(raw, floor)
+        }
+        // Corroborated structural fraud → at least High (60), even all-Tier-3.
+        if (hasStructuralCorroboration) raw = Math.max(raw, 60)
+        // Weak-only Low ceiling — the false-positive backstop for legit docs.
+        // Applied ONLY when there is neither a strong (Tier 1/2) flag NOR a
+        // corroborated structural fraud, so real frauds are never clamped but a
+        // legit doc's handful of weak/circumstantial misfires stay Low.
+        if (!hasStrongFlag && !hasStructuralCorroboration) raw = Math.min(raw, 24)
+        return raw
       })()
 
   const keyDrivers = isInvestmentRelated

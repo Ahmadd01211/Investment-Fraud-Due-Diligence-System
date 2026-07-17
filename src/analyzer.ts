@@ -33,6 +33,7 @@ import { maxPageMarker, ocrPagesToMarkedText, mergeTextSources } from './textmer
 import {
   FLAG_FRAMEWORK,
   RULE_BY_N,
+  TIER_RANK,
   CHUNK_EVAL_PROMPT,
   REPORT_PROMPT,
   type ChunkEvaluation,
@@ -54,6 +55,8 @@ export type Bindings = ProviderEnv & {
   MAX_CHUNK_CHARS?: string
   MIN_CHUNK_CHARS?: string
   SKIP_BOILERPLATE?: string
+  /** "true" enables bounded self-consistency voting on borderline chunks. */
+  SELF_CONSISTENCY?: string
 
   // ── Optional accounts (Feature B) ──
   SESSION_SECRET?: string
@@ -248,6 +251,10 @@ function normalizeChunkEval(raw: any, chunk: Chunk): ChunkEvaluation {
     const id = Number(r?.rule_id)
     if (RULE_BY_N.has(id)) byId.set(id, r)
   }
+  // Deterministic pre-scoring canonicalization (pure function of the bytes):
+  //   • Tier 1 is reserved for primary-source docs — clamp it otherwise.
+  //   • Confidence is snapped to a 0.1 ladder so jitter can't flip the gate.
+  const primary = PRIMARY_SOURCE_RE.test(chunk.text)
   // Ensure ALL 21 rules present.
   const rules: RuleFinding[] = FLAG_FRAMEWORK.map((def) => {
     const r = byId.get(def.n)
@@ -263,14 +270,26 @@ function normalizeChunkEval(raw: any, chunk: Chunk): ChunkEvaluation {
     return {
       rule_id: def.n,
       triggered,
-      confidence: clamp(Number(r?.confidence) || 0, 0, 1),
-      evidence_tier: (r?.evidence_tier || 'GAP') as any,
+      confidence: snapConfidence(r?.confidence),
+      evidence_tier: canonicalTier(String(r?.evidence_tier || 'GAP'), primary) as any,
       evidence,
     }
   })
+
+  // Deterministic detectors (relevance + legitimacy) computed from the chunk
+  // text. merge.ts unions these across chunks — relevance and false-positive
+  // suppression become a pure function of the document bytes.
+  const det = {
+    invFamilies: matchedFamilies(chunk.text, INVESTMENT_LEXICON),
+    legitFamilies: matchedFamilies(chunk.text, LEGIT_DISCLOSURE_LEXICON),
+    hasLtv: HAS_LTV_RE.test(chunk.text),
+    hasLoss: HAS_LOSS_POS_RE.test(chunk.text) && !HAS_LOSS_NEG_RE.test(chunk.text),
+  }
+
   return {
     chunk_id: chunk.chunk_id,
     page_range: [chunk.startPage || 0, chunk.endPage || 0],
+    det,
     // Accept boolean true, string "true", or 1 — DeepSeek sometimes returns strings.
     // If rules were triggered, it's investment-related regardless of what the model said.
     is_investment_related: raw?.is_investment_related === true
@@ -281,6 +300,79 @@ function normalizeChunkEval(raw: any, chunk: Chunk): ChunkEvaluation {
     rules,
     claims: Array.isArray(raw?.claims) ? raw.claims : [],
   }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  DETERMINISTIC TEXT DETECTORS  (pure TS — no LLM)
+//
+//  Relevance and false-positive suppression must NOT depend on a
+//  non-deterministic LLM boolean. These detectors read the chunk bytes and
+//  produce stable signals that merge.ts consumes, so the same document always
+//  yields the same relevance verdict and the same legitimacy suppression.
+// ════════════════════════════════════════════════════════════════
+
+// Investment-vocabulary families. Relevance requires ≥3 DISTINCT families across
+// the whole document — broad enough to catch any real offering, specific enough
+// that a recipe or news article (which may mention "$5" and "20%") stays under 3.
+const INVESTMENT_LEXICON: RegExp[] = [
+  /\b(invest(or|ment|ing)?|offering|securit(y|ies)|fund|equity|debenture|note|bond|prospectus)\b/i,
+  /\b(irr|roi|yield|returns?|distribution|dividend|coupon|nav|aum|preferred return)\b/i,
+  /\b(ppm|private placement|reg(ulation)?\s?d|form\s?d|accredited investor|subscription agreement|rule\s?506)\b/i,
+  /\b(capital (call|contribution|commitment)|general partner|limited partner|\bgp\b|\blp\b|sponsor|promoter)\b/i,
+  /\b(minimum investment|per (unit|share)|\bunits?\b|\bshares?\b|cap(italization)? table)\b/i,
+  /\$\s?\d[\d,]{2,}/,
+  /\b\d{1,2}(\.\d+)?\s?%/,
+]
+
+// Genuine-disclosure families. ≥3 DISTINCT families across the document marks a
+// well-disclosed offering, which deterministically suppresses weak/soft flags.
+const LEGIT_DISCLOSURE_LEXICON: RegExp[] = [
+  /past performance\b[^.]{0,40}\b(not|no)\b[^.]{0,20}(indicativ|guarante)/i,
+  /\brisk factors?\b/i,
+  /\byou (may|could|can|might) lose\b[^.]{0,30}(principal|investment|money|capital)/i,
+  /\b(speculative|illiquid)\b/i,
+  /\bno (assurance|guarantee)\b/i,
+  /\bcik\s*#?\s*\d{6,}\b|\bsec file (no|number)\b|\bform\s?d\b|\brule\s?506\s*\(\s*[bc]\s*\)/i,
+  /\bcrd\s*#?\s*\d{4,}\b|\biard\s*#?\s*\d{4,}\b/i,
+  /\baudited\b[^.]{0,20}\bstatements?\b|\bindependent (registered )?(public )?(auditor|accounting)/i,
+  /\b(qualified custodian|custodian|transfer agent|escrow agent)\b/i,
+  /\bloan[- ]to[- ]value\b|\bltv\b[^.]{0,15}\d{1,3}\s*%|\bpurchase price\b|\bcap rate\b/i,
+]
+
+// Rule 15 (no LTV/price disclosed) is nullified when ANY of these appear.
+const HAS_LTV_RE = /\bloan[- ]to[- ]value\b|\bltv\b|\bpurchase price\b|\bcap rate\b|\bacquisition price\b/i
+// Rule 16 (no loss/failed-deal disclosure) is nullified by GENUINE loss/risk
+// disclosure — but NOT by a scam's negated whitewash ("zero chance of loss").
+const HAS_LOSS_POS_RE = /\brisk factors?\b|\b(may|could|might) lose\b|\bloss of (principal|capital|investment)\b|\brisk of loss\b|\bno assurance\b|\bloss(es)?\b|\bdefault(ed|s)?\b|\bimpair(ment|ed)?\b|\bwrite[- ]?down\b|\bunderperform/i
+const HAS_LOSS_NEG_RE = /\b(no|zero|without|never|cannot|can'?t|impossible)\b[^.]{0,15}\bloss(es)?\b|\bno (chance|risk) of loss\b|\bloss[- ]free\b|\bcannot lose\b/i
+
+// Tier 1 is reserved for primary-source documents. If none of these markers are
+// present, an LLM "Tier 1" is canonicalized down to Tier 2 (marketing copy).
+const PRIMARY_SOURCE_RE = /\b(form\s?d|private placement memorandum|\bppm\b|finra|brokercheck|audited (financial )?statements?|form\s?adv|10-?k|prospectus)\b/i
+
+// Rule 2 projection guard: a high number labelled "target/projected/..." is not a
+// promise. It is injected at a WEAK tier so it cannot arm the strong-flag logic.
+const PROJECTION_RE = /\b(target(ed|ing)?|projected|illustrative|pro[- ]?forma|estimated|expected|up to|potential|anticipated)\b/i
+const FIXED_RE = /\b(fixed|guaranteed|guarantee|coupon|locked[- ]in)\b/i
+
+/** Distinct family indices from a lexicon that match the text. */
+function matchedFamilies(text: string, lexicon: RegExp[]): number[] {
+  const out: number[] = []
+  for (let i = 0; i < lexicon.length; i++) if (lexicon[i].test(text)) out.push(i)
+  return out
+}
+
+/** Snap a raw confidence to a fixed 0.1 ladder (round-half-up) so jittery
+ * DeepSeek floats like 0.44 vs 0.46 can't flip the merge trigger gate. */
+function snapConfidence(c: any): number {
+  return Math.round(clamp(Number(c) || 0, 0, 1) * 10) / 10
+}
+
+/** Clamp an LLM "Tier 1" to "Tier 2" unless a primary-source marker is present. */
+function canonicalTier(tier: string, primary: boolean): string {
+  const t = String(tier || 'GAP')
+  if (/tier\s*1/i.test(t) && !primary) return 'Tier 2'
+  return t
 }
 
 // ── Deterministic pattern-matching backstop ──────────────────────
@@ -350,13 +442,27 @@ const BACKSTOP_RULES: PatternRule[] = [
   },
 ]
 
+/**
+ * Resolve the tier a backstop injection should use for THIS chunk. Rule 2 is
+ * demoted to a weak tier when the high number is only a PROJECTION
+ * ("target/projected 20% IRR") rather than a FIXED/guaranteed coupon — so a
+ * legitimate high-yield fund is not force-flagged as a strong signal.
+ */
+function backstopTier(bp: PatternRule, textLower: string): string {
+  if (bp.rule_id === 2 && PROJECTION_RE.test(textLower) && !FIXED_RE.test(textLower)) {
+    return 'Tier 3'
+  }
+  return bp.tier
+}
+
 function injectIfMissing(rules: any[], textLower: string, chunk: Chunk): void {
+  const rankOf = (t: string) => ({ 'Tier 1': 4, 'Tier 2': 3, 'Tier 3': 2, 'Tier 4': 1 }[t] || 0)
   for (const bp of BACKSTOP_RULES) {
     const matched = bp.patterns.some(p => p.test(textLower))
     if (!matched) continue
 
+    const tier = backstopTier(bp, textLower)
     const existing = rules.find((r: any) => Number(r?.rule_id) === bp.rule_id)
-    const rankOf = (t: string) => ({'Tier 1': 4, 'Tier 2': 3, 'Tier 3': 2, 'Tier 4': 1}[t] || 0)
 
     if (!existing || !existing.triggered) {
       // Inject the rule
@@ -364,29 +470,30 @@ function injectIfMissing(rules: any[], textLower: string, chunk: Chunk): void {
         rule_id: bp.rule_id,
         triggered: true,
         confidence: bp.confidence,
-        evidence_tier: bp.tier,
+        evidence_tier: tier,
         evidence: [{ page: chunk.startPage || 0, section: '', quote: '[pattern-matched]', reason: bp.reason }],
       }
       if (existing) Object.assign(existing, injected)
       else rules.push(injected)
-      console.log(`[backstop] injected rule #${bp.rule_id} at ${bp.tier}`)
-    } else if (rankOf(bp.tier) > rankOf(existing.evidence_tier)) {
+      console.log(`[backstop] injected rule #${bp.rule_id} at ${tier}`)
+    } else if (rankOf(tier) > rankOf(existing.evidence_tier)) {
       // Upgrade tier
-      console.log(`[backstop] upgraded rule #${bp.rule_id} from ${existing.evidence_tier} to ${bp.tier}`)
-      existing.evidence_tier = bp.tier
+      console.log(`[backstop] upgraded rule #${bp.rule_id} from ${existing.evidence_tier} to ${tier}`)
+      existing.evidence_tier = tier
       existing.confidence = Math.max(existing.confidence, bp.confidence)
     }
   }
 }
 
 /**
- * Evaluate ONE chunk against the 21 rules using the active provider's
- * strongest reasoning model. Returns a strict ChunkEvaluation.
+ * Evaluate ONE chunk ONCE at a given decoding seed. Runs the deterministic
+ * backstop and returns a normalized ChunkEvaluation.
  */
-export async function evaluateChunk(
+async function evaluateChunkOnce(
   provider: AIProvider,
   chunk: Chunk,
-  ctx: string[]
+  ctx: string[],
+  seed: number
 ): Promise<ChunkEvaluation> {
   const pageNote = chunk.startPage
     ? `This chunk spans pages ${chunk.startPage}–${chunk.endPage}. The text below preserves [[PAGE n]] markers; cite the page each quote appears on.`
@@ -407,27 +514,113 @@ export async function evaluateChunk(
     role: 'reason',
     systemPrompt: CHUNK_EVAL_PROMPT(),
     userContent,
+    seed,
   })
-  console.log(`[evaluateChunk] chunk=${chunk.chunk_id} provider=${res.provider} model=${res.model} contentLen=${res.content?.length}`)
   const raw = safeParseJson(res.content, res.finishReason)
 
   // Deterministic backstop: pattern-match the chunk text for dispositive signals
   // that DeepSeek inconsistently catches. If the text matches, inject/upgrade
-  // the rule so scoring never depends on LLM non-determinism.
+  // the rule so scoring never depends on LLM non-determinism. Because this is a
+  // pure regex over the SAME text, it produces identical injections in every
+  // sample, so majority-voting can never out-vote a backstop rule.
   const rulesArr: any[] = Array.isArray(raw?.rules) ? raw.rules : []
   const textLower = chunk.text.toLowerCase()
   injectIfMissing(rulesArr, textLower, chunk)
-
   raw.rules = rulesArr
-  // If pattern matching found investment language, force relevance
   if (raw?.is_investment_related !== true && rulesArr.some((r: any) => r?.triggered)) {
     raw.is_investment_related = true
   }
-
-  const triggeredIds = rulesArr.filter((r: any) => r?.triggered).map((r: any) => r?.rule_id)
-  console.log(`[evaluateChunk] triggered_rules=${triggeredIds.join(',')}`)
-
   return normalizeChunkEval(raw, chunk)
+}
+
+// ── Bounded self-consistency (opt-in via env.SELF_CONSISTENCY="true") ──
+// The deterministic detectors + backstop + calibration already make relevance,
+// legitimacy, tier, confidence, and scoring pure functions of the bytes. The
+// only residual variance is WHICH rules DeepSeek emits on a borderline chunk.
+// When enabled, a chunk whose first pass has a jittery (non-backstop) trigger is
+// re-sampled at two more seeds and majority-voted. Clean chunks and
+// backstop-only chunks stay at ONE call, so cost is bounded to where it matters.
+const SC_SEEDS = [42, 7, 99]
+const RANK_TO_TIER: Record<number, string> = { 4: 'Tier 1', 3: 'Tier 2', 2: 'Tier 3', 1: 'Tier 4', 0: 'GAP' }
+
+/** A rule injected by the deterministic backstop (its quote is a sentinel). */
+function isInjectedRule(r: RuleFinding): boolean {
+  return (r.evidence || []).some((e) => e?.quote === '[pattern-matched]')
+}
+
+/** A chunk is "borderline" if it has a NON-backstop triggered rule sitting on a
+ *  scoring boundary (Tier 2/3 toggles the strong-flag gate; low confidence
+ *  toggles the confidence gate; a near-minimum quote toggles the evidence gate). */
+function isBorderline(ev: ChunkEvaluation): boolean {
+  const trig = ev.rules.filter((r) => r.triggered && !isInjectedRule(r))
+  for (const r of trig) {
+    if (r.evidence_tier === 'Tier 2' || r.evidence_tier === 'Tier 3') return true
+    if (r.confidence <= 0.5) return true
+    const bestQuote = (r.evidence || []).reduce((m, e) => Math.max(m, (e?.quote || '').length), 0)
+    if (bestQuote > 0 && bestQuote < 20) return true
+  }
+  return false
+}
+
+/** Deterministic majority vote across N samples of the same chunk. A rule
+ *  survives iff ≥⌈N/2⌉ samples triggered it; its tier/confidence are the median
+ *  of the triggering samples; evidence is the union. */
+function voteChunkEvals(samples: ChunkEvaluation[], chunk: Chunk): ChunkEvaluation {
+  const need = Math.ceil(samples.length / 2)
+  const median = (xs: number[]) => xs.slice().sort((a, b) => a - b)[Math.floor((xs.length - 1) / 2)]
+  const voted: RuleFinding[] = []
+  for (const def of FLAG_FRAMEWORK) {
+    const hits = samples
+      .map((s) => s.rules.find((r) => r.rule_id === def.n))
+      .filter((r): r is RuleFinding => !!r && r.triggered)
+    if (hits.length < need) continue
+    const medRank = median(hits.map((h) => TIER_RANK[h.evidence_tier] ?? 0))
+    const evidence = hits.flatMap((h) => h.evidence || []).slice(0, 8)
+    voted.push({
+      rule_id: def.n,
+      triggered: true,
+      confidence: median(hits.map((h) => h.confidence)),
+      evidence_tier: (RANK_TO_TIER[medRank] || 'Tier 3') as any,
+      evidence,
+    })
+  }
+  const base = samples[0]
+  console.log(`[selfConsistency] chunk=${chunk.chunk_id} samples=${samples.length} voted=[${voted.map((v) => v.rule_id).join(',')}]`)
+  return {
+    chunk_id: chunk.chunk_id,
+    page_range: base.page_range,
+    is_investment_related: samples.some((s) => s.is_investment_related),
+    not_relevant_reason: base.not_relevant_reason,
+    rules: voted,
+    claims: base.claims,
+    det: base.det, // deterministic — identical across samples
+  }
+}
+
+/**
+ * Evaluate ONE chunk against the 21 rules. One LLM call by default; when
+ * `voteOnBorderline` is set and the first pass is borderline, draw two more
+ * samples at different seeds and majority-vote for run-to-run stability.
+ */
+export async function evaluateChunk(
+  provider: AIProvider,
+  chunk: Chunk,
+  ctx: string[],
+  voteOnBorderline = false
+): Promise<ChunkEvaluation> {
+  const first = await evaluateChunkOnce(provider, chunk, ctx, SC_SEEDS[0])
+  if (!voteOnBorderline || !isBorderline(first)) return first
+
+  const samples: ChunkEvaluation[] = [first]
+  for (let i = 1; i < SC_SEEDS.length; i++) {
+    try {
+      samples.push(await evaluateChunkOnce(provider, chunk, ctx, SC_SEEDS[i]))
+    } catch (err: any) {
+      // One failed re-sample never fails the chunk — vote on what we have.
+      console.warn(`[selfConsistency] resample seed=${SC_SEEDS[i]} failed: ${String(err?.message || '').slice(0, 120)}`)
+    }
+  }
+  return samples.length >= 2 ? voteChunkEvals(samples, chunk) : first
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -550,6 +743,24 @@ export function assembleResult(merged: MergedDataset, report: FinalReport) {
 //  path is kept for small submissions and images where one request is safe.
 // ════════════════════════════════════════════════════════════════
 
+// ── Content-hash idempotency cache (optional; needs env.KV) ──
+// Guarantees byte-identical output on re-upload of the SAME material, and cuts
+// cost to zero on repeats. PROMPT_VERSION MUST be bumped on any rules.ts prompt
+// or merge.ts scoring change so a stale cache never serves an old score.
+const PROMPT_VERSION = 'v6.1'
+
+/** 64-bit FNV-1a (two streams) → collision-resistant hex cache key. */
+export function stableHash(s: string): string {
+  let h1 = 0x811c9dc5
+  let h2 = 0xc9dc5118
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    h1 = Math.imul(h1 ^ c, 0x01000193)
+    h2 = Math.imul(h2 ^ c, 0x01000193) + (c << 1)
+  }
+  return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0')
+}
+
 export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
   if (!hasProvider(env)) {
     throw new Error('SERVICE_AUTH: Analysis service is not configured. Set DEEPSEEK_API_KEY (primary) or OPENAI_API_KEY (fallback).')
@@ -563,10 +774,21 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
   // DeepSeek only ever receives text.
   const material = await prepareMaterial(env, rawMaterial, images)
 
+  // Idempotency cache: identical material + context + prompt version → identical
+  // result, served instantly. Guarded so the no-KV path is unaffected.
+  const cacheKey = 'analysis:' + stableHash(PROMPT_VERSION + '|' + material + '|' + ctx.join('|'))
+  if (env.KV) {
+    try {
+      const hit = await env.KV.get(cacheKey)
+      if (hit) return JSON.parse(hit)
+    } catch { /* cache miss / unavailable → recompute */ }
+  }
+
+  const vote = String(env.SELF_CONSISTENCY || '').toLowerCase() === 'true'
   const chunks = buildChunks(env, material)
   const evals: ChunkEvaluation[] = []
   for (let i = 0; i < chunks.length; i++) {
-    evals.push(await evaluateChunk(provider, chunks[i], ctx))
+    evals.push(await evaluateChunk(provider, chunks[i], ctx, vote))
   }
 
   const merged = mergeEvaluations(evals)
@@ -574,7 +796,13 @@ export async function analyzeSubmission(env: Bindings, input: AnalyzeInput) {
     throw new Error('NOT_RELEVANT:' + merged.notRelevantReason)
   }
   const report = await generateReport(provider, merged)
-  return assembleResult(merged, report)
+  const out = assembleResult(merged, report)
+  if (env.KV) {
+    try {
+      await env.KV.put(cacheKey, JSON.stringify(out), { expirationTtl: 60 * 60 * 24 * 30 })
+    } catch { /* cache write best-effort */ }
+  }
+  return out
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -618,7 +846,8 @@ export async function analyzeChunkRequest(env: Bindings, input: ChunkRequestInpu
     endPage: Number(input.endPage) || 0,
     headings: Array.isArray(input.headings) ? input.headings : [],
   }
-  return evaluateChunk(provider, chunk, ctx)
+  const vote = String(env.SELF_CONSISTENCY || '').toLowerCase() === 'true'
+  return evaluateChunk(provider, chunk, ctx, vote)
 }
 
 /** Merge per-chunk ChunkEvaluations into the final scored + reported result. */

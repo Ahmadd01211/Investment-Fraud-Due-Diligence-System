@@ -42,6 +42,9 @@ export interface ChatRequest {
   forceModel?: string
   /** Cap on output tokens for non-reasoning models. */
   maxTokens?: number
+  /** Optional decoding seed. Used by self-consistency to draw independent
+   *  samples of the SAME chunk (seeds 42/7/99) that are then majority-voted. */
+  seed?: number
 }
 
 /** Normalized result of a single chat call. */
@@ -156,7 +159,7 @@ class OpenAICompatibleProvider implements AIProvider {
       ]
       reqBody.response_format = { type: 'json_object' }
       reqBody.temperature = 0
-      reqBody.seed = 42
+      reqBody.seed = req.seed ?? 42
       reqBody.max_tokens = req.maxTokens || (req.role === 'reason' ? 16000 : 4000)
     } else if (isOpenAIReasoning) {
       reqBody.messages = [
@@ -173,7 +176,7 @@ class OpenAICompatibleProvider implements AIProvider {
       ]
       reqBody.response_format = { type: 'json_object' }
       reqBody.temperature = 0
-      reqBody.seed = 42
+      reqBody.seed = req.seed ?? 42
       reqBody.max_tokens = req.maxTokens || (req.role === 'reason' ? 16000 : 4000)
     }
     return reqBody

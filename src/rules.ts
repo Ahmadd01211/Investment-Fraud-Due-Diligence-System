@@ -112,6 +112,23 @@ export interface RuleFinding {
   evidence: RuleEvidence[]
 }
 
+/**
+ * Deterministic detector outputs computed in TypeScript from the chunk text
+ * (NOT the LLM). These make relevance + false-positive suppression a pure
+ * function of the bytes, so the same document always scores the same.
+ * Populated by normalizeChunkEval; consumed by mergeEvaluations.
+ */
+export interface ChunkDetectors {
+  /** Distinct investment-lexicon family indices matched in this chunk. */
+  invFamilies: number[]
+  /** Distinct legitimate-disclosure family indices matched in this chunk. */
+  legitFamilies: number[]
+  /** Chunk discloses a purchase price / LTV / cap rate (nullifies rule 15). */
+  hasLtv: boolean
+  /** Chunk contains genuine (non-negated) loss/risk disclosure (nullifies rule 16). */
+  hasLoss: boolean
+}
+
 /** The strict JSON a chunk evaluation must return. */
 export interface ChunkEvaluation {
   chunk_id: number
@@ -124,6 +141,8 @@ export interface ChunkEvaluation {
   rules: RuleFinding[]
   /** Optional extracted claims observed in this chunk (evidence, not scoring). */
   claims?: { type: string; claim: string; concern: string; page?: number }[]
+  /** Deterministic TS detector outputs (relevance + legitimacy). */
+  det?: ChunkDetectors
 }
 
 // ── Chunk-evaluation system prompt (RULE EVALUATION ONLY) ─────────
@@ -157,16 +176,23 @@ THE 21 RULES (consider every one; output only those that fire):
 ${FLAG_FRAMEWORK.map((f) => `Rule ${f.n}: ${f.name}`).join('\n')}
 
 RULE-SPECIFIC GUIDANCE (apply carefully):
-  Rule 2: ANY fixed annual return ≥17% on a bond, fund, or note triggers this. "16% annual fixed yield" = triggers.
-  Rule 6: "Guaranteed/Risk-Free" includes IMPLIED guarantees — "fixed returns", "secure returns", "capital safeguard", "100% payback", "minimal risk", "predictable returns" all qualify. The word "guaranteed" does NOT need to appear literally. If the language systematically removes any perception of investment risk, this rule fires.
+  Rule 2: A FIXED or GUARANTEED annual coupon/yield ≥16%, or a stated REALIZED IRR ≥17%, triggers this. "16% annual fixed yield" = triggers. A number labelled "target", "projected", "illustrative", "pro forma", "up to", "expected", or "anticipated" is a PROJECTION — do NOT trigger Rule 2 on a projection alone.
+  Rule 6: "Guaranteed/Risk-Free" includes IMPLIED guarantees — "fixed returns", "secure returns", "capital safeguard", "100% payback", "minimal risk", "predictable returns" all qualify. The word "guaranteed" does NOT need to appear literally. Rule 6 fires ONLY on language that REMOVES the perception of risk. Standard risk disclosure is the OPPOSITE and must NOT trigger it (see DO-NOT-TRIGGER GUARDS).
   Rule 10: Google Ads UTM parameters (utm_source=google_ads), Facebook pixel IDs, or mass-media mentions prove mass advertising.
   Rule 19: Multiple aggressive CTAs ("Book a meeting", "Request a callback", "Schedule now") concentrated in a short document = high-pressure sales.
 
-EVIDENCE TIER (pick the single best-fitting tier for each TRIGGERED rule):
-  Tier 1 = primary-source / direct documentary proof (the PPM text itself, a Form D, a FINRA bar record, an audited statement).
-  Tier 2 = strong secondary evidence (the promoter's own ad / brochure / website language quoted verbatim).
-  Tier 3 = weaker / indirect / circumstantial evidence.
-  Tier 4 = inference or pattern-match only (no concrete proof in this chunk).
+DO-NOT-TRIGGER GUARDS (obey exactly — these prevent false positives on legitimate offerings):
+  Rule 6: Standard risk disclosure is a NEGATIVE signal — do NOT trigger on "past performance is not indicative", "investments involve risk", "you may lose your principal", "returns are not guaranteed", "speculative and illiquid", or on "target"/"projected" returns. Rule 6 fires ONLY on language that REMOVES risk ("guaranteed", "risk-free", "principal protected", "capital safeguard", "cannot lose") with NO offsetting disclaimer in the same chunk.
+  Rule 2: Do NOT trigger on a number labelled "target", "projected", "illustrative", "pro forma", "up to", "expected", or "anticipated". Trigger only on a FIXED/guaranteed coupon or a stated REALIZED IRR ≥17% (a 16% FIXED coupon triggers; a 16% "target" does not).
+  Rule 15: Do NOT trigger if the chunk discloses ANY purchase price, appraisal, LTV, loan-to-cost, or cap-rate figure.
+  Rule 16: Do NOT trigger if the chunk contains ANY risk-factors section, loss/impairment disclosure, or a track record that includes losses.
+
+EVIDENCE TIER — answer IN ORDER, STOP at the first "yes"; never average or hedge between two tiers:
+  Q1  Is the evidence a PRIMARY SOURCE inside THIS document (the PPM/subscription agreement text itself, a Form D, an audited financial statement, a FINRA/SEC record)?  → Tier 1
+  Q2  Is it the promoter's OWN persuasive/marketing language (a headline, landing page, email, ad, or script) quoted verbatim?  → Tier 2
+  Q3  Is it a factual-but-indirect item (a number, table cell, address, footnote) that needs one more fact to prove the issue?  → Tier 3
+  Q4  Otherwise it is pure inference / pattern-match  → Tier 4 (and usually DO NOT trigger).
+  Tier 1 is RESERVED for primary-source documents; NEVER label marketing copy Tier 1.
 
 TRIGGERING RULES (follow exactly for determinism — the same chunk must always produce the same findings):
   • Output a rule ONLY when triggered=true — i.e. THIS CHUNK affirmatively contains problematic content (a bad claim, a contradiction, a prohibited practice). Assign the appropriate Tier 1–4.
@@ -176,11 +202,16 @@ TRIGGERING RULES (follow exactly for determinism — the same chunk must always 
   • If a rule does not fire in this chunk, OMIT it entirely from the "rules" array. Never output triggered=false rows.
   • Use the HIGHEST tier the evidence clearly supports; do not hedge between two tiers.
   • Only quote text that actually appears in the material of THIS chunk. Every evidence item MUST include the page number where it appears (use the [[PAGE n]] markers in the text; if none are present use 0).
-  • confidence is your own 0.0–1.0 certainty that the rule is correctly triggered for this chunk. It is NOT a score and does not affect points; it is used only to aggregate evidence across chunks. Use ≥0.45 for a genuine trigger.
+  • confidence — output EXACTLY one of three values so the same quote always scores the same: 1.0 (explicit, literal instance of the rule), 0.9 (clear via an established synonym), 0.7 (strongly implied, one inferential step). If your honest certainty is ≤0.5, DO NOT emit the rule. Never output any other number. confidence is NOT a score; it only aggregates evidence across chunks.
 
 RELEVANCE GATE (do this FIRST):
   • Decide whether THIS CHUNK is about an investment, financial offering, fund, securities, business opportunity, money-making scheme, or a solicitation to invest/send money.
   • A random photo, unrelated screenshot, blank/index/signature/appendix page, or off-topic text is NOT investment-related. If so, set is_investment_related=false, give a short not_relevant_reason, and return an empty "rules" array.
+
+WORKED EXAMPLE — LEGITIMATE OFFERING (investment-related but properly disclosed; emit NO rules):
+  Input: "The Fund is registered with the SEC (CIK 0001234567). Past performance is not indicative of future results; investments involve risk, including the possible loss of principal. Target LTV is capped at 65%. Financial statements are audited annually by an independent registered public accounting firm."
+  Correct output: {"chunk_id":0,"page_range":[1,1],"is_investment_related":true,"not_relevant_reason":"","rules":[],"claims":[]}
+  Why: proper risk disclosure, a real CIK, a disclosed LTV cap, and audited financials are the HALLMARKS OF LEGITIMACY. They must NOT trigger any rule. Do not confuse disclosure with fraud.
 
 OUTPUT — respond with ONLY a single valid JSON object (no markdown, no commentary) in EXACTLY this shape:
 {
