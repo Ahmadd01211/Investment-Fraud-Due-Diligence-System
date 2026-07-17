@@ -50,8 +50,6 @@ export const FLAG_FRAMEWORK: FraudRule[] = [
   { n: 21, name: 'Asset Overpayment / Book Value Mismatch', weight: 9 },
 ]
 
-
-// Test Comment
 /** Quick lookup: rule number → definition. */
 export const RULE_BY_N: Map<number, FraudRule> = new Map(FLAG_FRAMEWORK.map((f) => [f.n, f]))
 
@@ -132,8 +130,13 @@ export interface ChunkEvaluation {
 //
 //  Critical differences from the old single-shot prompt:
 //    • The model DOES NOT compute riskScore / weightedPoints / riskLevel.
-//    • The model returns ALL 21 rules every time (triggered true/false).
-//    • Each rule carries confidence + evidence[] with page/quote/reason.
+//    • The model considers ALL 21 rules internally but OUTPUTS ONLY the ones
+//      that TRIGGER (triggered=true). This is a large token saving: a typical
+//      chunk fires 0–5 rules, so emitting 21 objects (16+ of them empty GAPs)
+//      every time wastes output tokens on every chunk of a long document.
+//      merge.ts + normalizeChunkEval default every un-returned rule to
+//      not-triggered/GAP, so omitting them is lossless.
+//    • Each triggered rule carries confidence + evidence[] with page/quote/reason.
 //    • Deterministic tier selection rules preserved from the original engine.
 
 export function CHUNK_EVAL_PROMPT(): string {
@@ -146,31 +149,30 @@ Your methodology is built on Barry Minkow's documented investigative framework a
 ║  YOUR JOB IS EVIDENCE EVALUATION ONLY — NOT SCORING.               ║
 ║  • Do NOT compute any risk score, percentage, weighted points, or  ║
 ║    risk level. The application computes all scores in code.        ║
-║  • For EVERY one of the 21 rules, report whether THIS CHUNK        ║
-║    triggers it, with an evidence tier and supporting evidence.     ║
+║  • Consider ALL 21 rules internally, but OUTPUT ONLY the rules      ║
+║    that TRIGGER on affirmative evidence in THIS chunk.             ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-THE 21 RULES (evaluate every one):
+THE 21 RULES (consider every one; output only those that fire):
 ${FLAG_FRAMEWORK.map((f) => `Rule ${f.n}: ${f.name}`).join('\n')}
 
-EVIDENCE TIER (pick the single best-fitting tier when a rule is TRIGGERED):
+EVIDENCE TIER (pick the single best-fitting tier for each TRIGGERED rule):
   Tier 1 = primary-source / direct documentary proof (the PPM text itself, a Form D, a FINRA bar record, an audited statement).
   Tier 2 = strong secondary evidence (the promoter's own ad / brochure / website language quoted verbatim).
   Tier 3 = weaker / indirect / circumstantial evidence.
   Tier 4 = inference or pattern-match only (no concrete proof in this chunk).
-  GAP    = the rule is SUSPECTED but the required evidence is simply MISSING from this chunk (e.g. "no PPM disclosed"). Use "GAP" as the tier for a not-affirmatively-triggered gap; set triggered=false for GAP.
 
 TRIGGERING RULES (follow exactly for determinism — the same chunk must always produce the same findings):
-  • triggered=true ONLY when THIS CHUNK affirmatively contains problematic content (a bad claim, a contradiction, a prohibited practice). Set the appropriate Tier 1–4.
-  • Never set triggered=true merely because something expected is ABSENT. Absence of a required disclosure → triggered=false with evidence_tier="GAP" (especially Rules 7, 11, 15, 16).
-  • If a rule does not apply to this chunk at all → triggered=false, evidence_tier="GAP", evidence: [].
+  • Output a rule ONLY when triggered=true — i.e. THIS CHUNK affirmatively contains problematic content (a bad claim, a contradiction, a prohibited practice). Assign the appropriate Tier 1–4.
+  • Never trigger a rule merely because something expected is ABSENT. Absence of a required disclosure is NOT a trigger — simply omit that rule (especially Rules 7, 11, 15, 16). Do NOT emit "GAP" rows.
+  • If a rule does not fire in this chunk, OMIT it entirely from the "rules" array. Never output triggered=false rows.
   • Use the HIGHEST tier the evidence clearly supports; do not hedge between two tiers.
   • Only quote text that actually appears in the material of THIS chunk. Every evidence item MUST include the page number where it appears (use the [[PAGE n]] markers in the text; if none are present use 0).
-  • confidence is your own 0.0–1.0 certainty that the rule is correctly triggered for this chunk. It is NOT a score and does not affect points; it is used only to aggregate evidence across chunks.
+  • confidence is your own 0.0–1.0 certainty that the rule is correctly triggered for this chunk. It is NOT a score and does not affect points; it is used only to aggregate evidence across chunks. Use ≥0.45 for a genuine trigger.
 
 RELEVANCE GATE (do this FIRST):
   • Decide whether THIS CHUNK is about an investment, financial offering, fund, securities, business opportunity, money-making scheme, or a solicitation to invest/send money.
-  • A random photo, unrelated screenshot, blank/index/signature/appendix page, or off-topic text is NOT investment-related. If so, set is_investment_related=false and not_relevant_reason to a short description; you may still return all 21 rules with triggered=false, evidence_tier="GAP", evidence: [].
+  • A random photo, unrelated screenshot, blank/index/signature/appendix page, or off-topic text is NOT investment-related. If so, set is_investment_related=false, give a short not_relevant_reason, and return an empty "rules" array.
 
 OUTPUT — respond with ONLY a single valid JSON object (no markdown, no commentary) in EXACTLY this shape:
 {
@@ -179,23 +181,23 @@ OUTPUT — respond with ONLY a single valid JSON object (no markdown, no comment
   "is_investment_related": <true | false>,
   "not_relevant_reason": "<short description if not investment-related, else empty>",
   "rules": [
+    // ONLY the rules that TRIGGER in this chunk (0 or more). Omit all others.
     {
       "rule_id": <1-21>,
-      "triggered": <true | false>,
-      "confidence": <0.0-1.0>,
-      "evidence_tier": "Tier 1" | "Tier 2" | "Tier 3" | "Tier 4" | "GAP",
+      "triggered": true,
+      "confidence": <0.45-1.0>,
+      "evidence_tier": "Tier 1" | "Tier 2" | "Tier 3" | "Tier 4",
       "evidence": [
         { "page": <int>, "section": "<heading/section label or empty>", "quote": "<verbatim quote from this chunk>", "reason": "<why this triggers the rule>" }
       ]
     }
-    // ... one object for EVERY rule 1..21, in ascending rule_id order
   ],
   "claims": [
     { "type": "<IRR/Returns|AUM|Track Record|Guarantee|FDIC|Licensing|...>", "claim": "<what the promoter asserts>", "concern": "<why verify>", "page": <int> }
   ]
 }
 
-You MUST include all 21 rule objects. For rules that do not fire in this chunk, return triggered=false, evidence_tier="GAP", evidence: [].`
+Output ONLY the triggered rules — if no rule fires, return "rules": []. Do NOT pad the array with non-triggered or "GAP" rows.`
 }
 
 // ── Final REPORT prompt (report generation ONLY, no scoring) ──────

@@ -251,6 +251,43 @@
       .trim();
   }
 
+  /* Is an extracted PDF text layer actually READABLE prose, or garbage?
+     Some PDFs (broken CID fonts, bad embedded OCR layers, DRM'd renders)
+     produce a text layer full of mojibake / replacement glyphs / "cid:NN"
+     tokens. If we trust that garbage we (a) poison the fraud analysis — the
+     model can't see the real language, so red flags never fire and the score
+     collapses — and (b) waste huge numbers of tokens on nonsense. When a page
+     fails this check we render it and OCR the image instead. Conservative on
+     purpose: number-heavy financial tables still pass. */
+  function looksReadable(text) {
+    const t = String(text || '');
+    let compactLen = 0, broken = 0, alnum = 0;
+    for (let k = 0; k < t.length; k++) {
+      const ch = t.charCodeAt(k);
+      if (ch === 32 || ch === 9 || ch === 10 || ch === 13 || ch === 12 || ch === 11) continue;
+      compactLen++;
+      // Broken-encoding glyphs: replacement char (0xFFFD) + Unicode
+      // private-use area (0xE000-0xF8FF) where un-mappable CID fonts land.
+      if (ch === 0xFFFD || (ch >= 0xE000 && ch <= 0xF8FF)) broken++;
+      // Letters (ASCII + Latin accents 0xC0-0x24F) and digits.
+      if (
+        (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) ||
+        (ch >= 48 && ch <= 57) || (ch >= 0xC0 && ch <= 0x24F)
+      ) alnum++;
+    }
+    if (compactLen < 12) return false;
+    // Too many broken glyphs -> trust the image render + OCR instead.
+    if (broken / compactLen > 0.03) return false;
+    // pdf.js emits (cid:NN) tokens when it cannot map a CID glyph.
+    if (/\(?cid:\d+\)?/i.test(t)) return false;
+    // Real prose contains actual multi-letter words.
+    const words = (t.match(/[A-Za-z]{3,}/g) || []).length;
+    if (words < 2) return false;
+    // Letters+digits should dominate; garbled text is mostly symbols.
+    if (alnum / compactLen < 0.5) return false;
+    return true;
+  }
+
   function mergeLineItems(items) {
     if (!items.length) return '';
     const sorted = [...items].sort((a, b) => a.x - b.x);
@@ -318,16 +355,25 @@
         pageText = lines.join('\n').trim();
       }
 
-      if (pageText.length >= 40) {
+      // Trust the text layer ONLY when it is genuinely readable. A broken /
+      // garbage text layer (CID-font mojibake, bad embedded OCR) would poison
+      // the fraud analysis and waste tokens — so treat it as image-only and
+      // let the vision model OCR the rendered page instead.
+      if (pageText.length >= 40 && looksReadable(pageText)) {
         // Real text layer → keep the exact text; DO NOT render/attach an image.
         textPages += 1;
         pageTextBlocks.push(`[[PAGE ${i}]]\n${pageText}`);
         continue;
       }
 
-      // 2) Image-only / scanned page → render it so OpenAI can OCR it (server-side).
+      // 2) Image-only / scanned / garbled page → render it so OpenAI can OCR it
+      //    (server-side). Render at ~2000px on the long edge: high enough for
+      //    accurate OCR, bounded so the JPEG stays small.
       if (images.length >= imageBudget) continue;
-      const viewport = page.getViewport({ scale: 1.4 });
+      const base = page.getViewport({ scale: 1 });
+      const longEdge = Math.max(base.width, base.height) || 1000;
+      const scale = Math.min(3, Math.max(1.5, 2000 / longEdge));
+      const viewport = page.getViewport({ scale });
       const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d');
       canvas.width = Math.floor(viewport.width);

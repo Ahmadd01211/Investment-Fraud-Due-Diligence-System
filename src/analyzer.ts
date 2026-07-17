@@ -156,7 +156,11 @@ function resolveChunkOptions(env: Bindings): ChunkOptions {
     const n = parseInt(String(v ?? ''), 10)
     return Number.isFinite(n) && n > 0 ? n : d
   }
-  const maxChunkChars = clamp(toInt(env.MAX_CHUNK_CHARS, 40000), 8000, 120000)
+  // 60k chars ≈ ~15k input tokens per chunk — comfortably inside DeepSeek's
+  // ~1M-token context and gpt-4o's 128k fallback, while keeping strong per-rule
+  // recall. Larger chunks mean fewer LLM calls, so the ~1.8k-token system prompt
+  // is re-sent fewer times (a direct token saving on long documents).
+  const maxChunkChars = clamp(toInt(env.MAX_CHUNK_CHARS, 60000), 8000, 120000)
   const minChunkChars = clamp(toInt(env.MIN_CHUNK_CHARS, 4000), 500, maxChunkChars)
   const skipBoilerplate = String(env.SKIP_BOILERPLATE ?? 'true').toLowerCase() !== 'false'
   return { maxChunkChars, minChunkChars, maxChunks: 400, skipBoilerplate }
@@ -292,7 +296,7 @@ export async function evaluateChunk(
     `NOTE: Any images or scanned pages the investor attached have already been ` +
     `transcribed (OCR) into the text below; evaluate the text as-is.\n\n` +
     `MATERIAL TO EVALUATE:\n"""\n${chunk.text}\n"""\n\n` +
-    `Evaluate ALL 21 rules against this chunk and return the JSON object only.`
+    `Consider all 21 rules against this chunk, but OUTPUT ONLY the rules that trigger. Return the JSON object only.`
 
   const res = await provider.chatJson({
     role: 'reason',

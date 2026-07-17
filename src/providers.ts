@@ -230,37 +230,94 @@ class OpenAICompatibleProvider implements AIProvider {
 
 // ── Default OCR: route images through OpenAI's vision model ──
 const OCR_SYSTEM_PROMPT =
-  'You are an OCR engine. Transcribe ALL text visible in the image faithfully and completely, ' +
-  'preserving reading order, line breaks, headings, tables (as tab/space aligned text), and numbers. ' +
-  'Do NOT summarize, interpret, or add commentary. ' +
-  'Respond ONLY with a JSON object: {"text": "<verbatim transcription>"}.'
+  'You are a precise OCR engine. Transcribe ALL text visible in the image faithfully and completely, ' +
+  'preserving reading order, line breaks, headings, tables (as tab/space aligned text), figures, and numbers exactly. ' +
+  'Transcribe small print, footnotes, disclaimers, and stamps too — they often carry the key claims. ' +
+  'Do NOT translate, summarize, interpret, correct, or add commentary. If the image contains no legible text, return an empty string. ' +
+  'Respond ONLY with a single JSON object: {"text": "<verbatim transcription>"}.'
+
+/** Extract the transcription from an OCR response, tolerating fenced/partial JSON. */
+function parseOcrText(raw: string): string {
+  const trimmed = String(raw || '').trim()
+  if (!trimmed) return ''
+  // Strip ```json … ``` fences some models add despite json_object mode.
+  const unfenced = trimmed.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim()
+  try {
+    const parsed = JSON.parse(unfenced)
+    if (parsed && typeof parsed.text === 'string') return parsed.text
+  } catch {
+    /* fall through to salvage */
+  }
+  // Salvage the "text" value from a truncated/partially-valid object — e.g. the
+  // model hit the output-token cap mid-transcription, leaving no closing quote.
+  const idx = unfenced.indexOf('"text"')
+  if (idx >= 0) {
+    const q = unfenced.indexOf('"', idx + '"text"'.length)
+    if (q >= 0) {
+      // Everything after the value's opening quote, minus a proper trailing close.
+      const body = unfenced.slice(q + 1).replace(/"\s*}?\s*$/, '')
+      try {
+        return JSON.parse('"' + body + '"')
+      } catch {
+        return body
+          .replace(/\\n/g, '\n')
+          .replace(/\\t/g, '\t')
+          .replace(/\\r/g, '\r')
+          .replace(/\\"/g, '"')
+          .replace(/\\\\/g, '\\')
+      }
+    }
+  }
+  // Last resort: if it does not look like JSON at all, treat as raw text.
+  if (!unfenced.startsWith('{') && !unfenced.startsWith('[')) return unfenced
+  return ''
+}
 
 class VisionOcrProvider implements OcrProvider {
   readonly name: string
   constructor(private provider: AIProvider) {
     this.name = `vision:${provider.name}`
   }
+
+  /** OCR one image; retries once on a transient rate-limit, else yields ''. */
+  private async ocrOne(url: string): Promise<string> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await this.provider.chatJson({
+          role: 'vision',
+          systemPrompt: OCR_SYSTEM_PROMPT,
+          userContent: [
+            { type: 'text', text: 'Transcribe this page verbatim as JSON {"text": "..."}.' },
+            // detail:"high" makes OpenAI tile the image at full resolution — far
+            // more accurate on dense pages, small print, and tables.
+            { type: 'image_url', image_url: { url, detail: 'high' } },
+          ],
+          // Dense full pages can exceed 4k output tokens and get truncated
+          // (garbled/half-missing OCR). Give the transcription room.
+          maxTokens: 8000,
+        })
+        return parseOcrText(res.content)
+      } catch (err: any) {
+        const msg = String(err?.message || '')
+        // Retry once after a short backoff on a rate-limit; otherwise give up on
+        // THIS page only (return '') so one bad page never fails the whole doc.
+        if (attempt === 0 && msg.startsWith('SERVICE_RATELIMIT:')) {
+          const secs = Number(msg.slice('SERVICE_RATELIMIT:'.length)) || 3
+          await new Promise((r) => setTimeout(r, Math.min(8000, Math.max(1000, secs * 1000))))
+          continue
+        }
+        console.warn(`[OCR] page transcription failed: ${msg.slice(0, 160)}`)
+        return ''
+      }
+    }
+    return ''
+  }
+
   async extract(images: string[], startPage = 1): Promise<OcrPage[]> {
     const pages: OcrPage[] = []
     // One call per image so page numbers stay exact and calls stay small.
     for (let i = 0; i < images.length; i++) {
-      const url = images[i]
-      const res = await this.provider.chatJson({
-        role: 'vision',
-        systemPrompt: OCR_SYSTEM_PROMPT,
-        userContent: [
-          { type: 'text', text: 'Transcribe this page verbatim as JSON {"text": "..."}.' },
-          { type: 'image_url', image_url: { url } },
-        ],
-        maxTokens: 4000,
-      })
-      let text = ''
-      try {
-        const parsed = JSON.parse(res.content)
-        text = String(parsed?.text || '')
-      } catch {
-        text = res.content // fall back to raw content if not valid JSON
-      }
+      const text = await this.ocrOne(images[i])
       pages.push({ page: startPage + i, text })
     }
     return pages
