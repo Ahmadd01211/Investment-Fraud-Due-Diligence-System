@@ -150,14 +150,13 @@ class OpenAICompatibleProvider implements AIProvider {
     const reqBody: any = { model }
 
     if (isDeepSeek) {
-      // DeepSeek: use system + user messages. No temperature/seed — DeepSeek
-      // handles determinism internally. Large output budget so structured JSON
-      // isn't truncated.
       reqBody.messages = [
         { role: 'system', content: req.systemPrompt },
         { role: 'user', content: typeof req.userContent === 'string' ? req.userContent : JSON.stringify(req.userContent) },
       ]
       reqBody.response_format = { type: 'json_object' }
+      reqBody.temperature = 0
+      reqBody.seed = 42
       reqBody.max_tokens = req.maxTokens || (req.role === 'reason' ? 16000 : 4000)
     } else if (isOpenAIReasoning) {
       reqBody.messages = [
