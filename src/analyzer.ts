@@ -557,16 +557,9 @@ const BACKSTOP_RULES: PatternRule[] = [
     confidence: 0.95,
     reason: 'Deterministic pattern match: false FDIC/SEC claim.',
   },
-  {
-    rule_id: 19,
-    patterns: [
-      // Requires ≥2 distinct CTA phrases in the same chunk
-    ],
-    tier: 'Tier 2',
-    confidence: 0.9,
-    reason: 'Deterministic pattern match: multiple aggressive sales CTAs concentrated in the same material.',
-  },
 ]
+// Rules 9, 15, 19 have custom backstop logic in injectIfMissing() — they
+// need multi-pattern counting or absence detection, not simple pattern.some().
 
 // ── Rule 19 CTA density detection ────────────────────────────────
 // Unlike other backstop rules which use simple pattern.some(), rule 19
@@ -704,6 +697,59 @@ function injectIfMissing(rules: any[], textLower: string, chunk: Chunk): void {
       console.log(`[backstop] upgraded rule #${bp.rule_id} from ${existing.evidence_tier} to ${tier}`)
       existing.evidence_tier = tier
       existing.confidence = Math.max(existing.confidence, bp.confidence)
+    }
+  }
+
+  // ── Rule 19: CTA density backstop ────────────────────────────
+  // Fires when ≥2 distinct CTA types appear in the same chunk.
+  const r19 = rules.find((r: any) => Number(r?.rule_id) === 19 && r?.triggered)
+  if (!r19) {
+    let ctaCount = 0
+    for (const p of CTA_PATTERNS) {
+      if (p.test(textLower)) ctaCount++
+    }
+    if (ctaCount >= 2) {
+      rules.push({
+        rule_id: 19,
+        triggered: true,
+        confidence: 0.9,
+        evidence_tier: 'Tier 2',
+        evidence: [{ page: chunk.startPage || 0, section: '', quote: '[pattern-matched]', reason: 'Deterministic pattern match: multiple aggressive sales CTAs concentrated in the same material.' }],
+      })
+      console.log(`[backstop] injected rule #19 (${ctaCount} distinct CTAs found)`)
+    }
+  }
+
+  // ── Rule 9: vertical integration backstop ────────────────────
+  const r9 = rules.find((r: any) => Number(r?.rule_id) === 9 && r?.triggered)
+  if (!r9 && detectVerticalIntegration(textLower)) {
+    rules.push({
+      rule_id: 9,
+      triggered: true,
+      confidence: 0.9,
+      evidence_tier: 'Tier 3',
+      evidence: [{ page: chunk.startPage || 0, section: '', quote: '[pattern-matched]', reason: 'Deterministic pattern match: multiple entities sharing the same brand control different fund roles.' }],
+    })
+    console.log(`[backstop] injected rule #9 (vertical integration detected)`)
+  }
+
+  // ── Rule 15: absent asset disclosure backstop ────────────────
+  // Only fires on investment-related chunks that lack asset-level detail
+  // AND don't refer readers to full offering documents.
+  const r15 = rules.find((r: any) => Number(r?.rule_id) === 15 && r?.triggered)
+  if (!r15) {
+    const isInvestmentPitch = rules.some((r: any) => r?.triggered && [2, 6].includes(Number(r?.rule_id)))
+    const hasAssetDetail = ASSET_DISCLOSURE_RE.test(textLower)
+    const refersToFullDocs = REFERS_TO_DOCS_RE.test(textLower)
+    if (isInvestmentPitch && !hasAssetDetail && !refersToFullDocs) {
+      rules.push({
+        rule_id: 15,
+        triggered: true,
+        confidence: 0.7,
+        evidence_tier: 'Tier 3',
+        evidence: [{ page: chunk.startPage || 0, section: '', quote: '[pattern-matched]', reason: 'Deterministic pattern match: investment offering with no purchase price, LTV, or asset-level disclosure.' }],
+      })
+      console.log(`[backstop] injected rule #15 (no asset disclosure in investment pitch)`)
     }
   }
 }
@@ -970,7 +1016,7 @@ export function assembleResult(merged: MergedDataset, report: FinalReport) {
 // Guarantees byte-identical output on re-upload of the SAME material, and cuts
 // cost to zero on repeats. PROMPT_VERSION MUST be bumped on any rules.ts prompt
 // or merge.ts scoring change so a stale cache never serves an old score.
-const PROMPT_VERSION = 'v8.2'
+const PROMPT_VERSION = 'v8.3'
 
 /** 64-bit FNV-1a (two streams) → collision-resistant hex cache key. */
 export function stableHash(s: string): string {
