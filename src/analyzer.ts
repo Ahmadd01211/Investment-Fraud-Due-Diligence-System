@@ -557,7 +557,59 @@ const BACKSTOP_RULES: PatternRule[] = [
     confidence: 0.95,
     reason: 'Deterministic pattern match: false FDIC/SEC claim.',
   },
+  {
+    rule_id: 19,
+    patterns: [
+      // Requires ≥2 distinct CTA phrases in the same chunk
+    ],
+    tier: 'Tier 2',
+    confidence: 0.9,
+    reason: 'Deterministic pattern match: multiple aggressive sales CTAs concentrated in the same material.',
+  },
 ]
+
+// ── Rule 19 CTA density detection ────────────────────────────────
+// Unlike other backstop rules which use simple pattern.some(), rule 19
+// fires only when ≥2 DISTINCT CTA types appear in the same chunk.
+const CTA_PATTERNS: RegExp[] = [
+  /\brequest\s+a?\s*callback\b/i,
+  /\bschedule\s+(a\s+)?(meeting|call|zoom|consultation|demo)\b/i,
+  /\bbook\s+(a\s+)?(meeting|call|session|appointment)\b/i,
+  /\b(invest|start|get\s+started|sign\s+up|register|subscribe)\s+now\b/i,
+  /\bcontact\s+us\s+(today|now)\b/i,
+  /\b(call|reach\s+out)\s+(us\s+)?(today|now)\b/i,
+  /\blimited\s+(spots?|availability|seats?|openings?)\b/i,
+  /\bonly\s+\d+\s+(spots?|seats?|remaining|left)\b/i,
+  /\bcountdown\b/i,
+  /\b(act|apply|join|enroll)\s+(now|today|fast|quickly|immediately)\b/i,
+]
+
+// ── Rule 9 vertical integration detection ────────────────────────
+// Detects when multiple entities sharing the same brand prefix control
+// different roles in the fund structure (issuer, arranger, manager, etc.)
+const ENTITY_ROLE_RE = /\b(\w{3,})\s+((?:debt\s+)?capital|wealth|financial|asset|invest(?:ment)?|fund|securities|consult)\b[^.]{0,60}\b(issuer|arranger|trustee|agent|manager|advisor|placement|paying|custodian|auditor)\b/gi
+
+function detectVerticalIntegration(text: string): boolean {
+  const brands = new Map<string, Set<string>>()
+  let m: RegExpExecArray | null
+  const re = new RegExp(ENTITY_ROLE_RE.source, 'gi')
+  while ((m = re.exec(text)) !== null) {
+    const brand = m[1].toLowerCase()
+    const role = m[3].toLowerCase()
+    if (!brands.has(brand)) brands.set(brand, new Set())
+    brands.get(brand)!.add(role)
+  }
+  for (const [, roles] of brands) {
+    if (roles.size >= 2) return true
+  }
+  return false
+}
+
+// ── Rule 15 absence-of-disclosure detection ──────────────────────
+// Fires when a chunk is clearly an investment offering but contains
+// NO purchase price, LTV, cap rate, or asset-level financial detail.
+const ASSET_DISCLOSURE_RE = /\b(purchase\s+price|acquisition\s+price|ltv|loan[- ]to[- ]value|cap\s*rate|capitalization\s+rate|appraisal|appraised\s+value|book\s+value)\b/i
+const REFERS_TO_DOCS_RE = /\b(see\s+(the\s+)?ppm|see\s+fund\s+documents|see\s+offering\s+(memorandum|documents)|full\s+offering\s+documents|due\s+diligence\s+materials)\b/i
 
 /**
  * Resolve the tier a backstop injection should use for THIS chunk. Rule 2 is
@@ -918,7 +970,7 @@ export function assembleResult(merged: MergedDataset, report: FinalReport) {
 // Guarantees byte-identical output on re-upload of the SAME material, and cuts
 // cost to zero on repeats. PROMPT_VERSION MUST be bumped on any rules.ts prompt
 // or merge.ts scoring change so a stale cache never serves an old score.
-const PROMPT_VERSION = 'v8.1'
+const PROMPT_VERSION = 'v8.2'
 
 /** 64-bit FNV-1a (two streams) → collision-resistant hex cache key. */
 export function stableHash(s: string): string {
